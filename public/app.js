@@ -416,7 +416,15 @@
     // first force sync once if empty
     loadCloudIndex(state.indexCount < 1).then(function () {
       // then soft refresh every 3 minutes
-      setInterval(function () { loadCloudIndex(true); }, 2 * 60 * 1000);
+      setInterval(function () {
+        // keep pumping cloud fill while incomplete
+        var incomplete = state.crawl && state.crawl.totalPages && state.crawl.nextPage && state.crawl.nextPage <= state.crawl.totalPages;
+        loadCloudIndex(true);
+        if (incomplete || state.indexCount < 8000) {
+          // also kick server fill endpoint (fire-and-forget)
+          fetch('/api/cover-index', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'fill', crawlPages: 30, pageSize: 50 }) }).catch(function(){});
+        }
+      }, 60 * 1000);
     });
   }
   function cancelWork(msg) {

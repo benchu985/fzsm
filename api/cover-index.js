@@ -31,7 +31,7 @@ module.exports = async function handler(req, res) {
     // empty always try; or client asked; or stale
     if (blobEnabled && (empty || wantSync || stale)) {
       try {
-        sync = await syncIndex({ newestPages: empty ? 6 : 3, crawlPages: empty ? 15 : 6, pageSize: 30, imgConcurrency: 10 });
+        sync = await syncIndex({ mode: empty ? 'fill' : 'balanced', newestPages: empty ? 1 : 2, crawlPages: empty ? 35 : 18, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
         index = await readIndex();
       } catch (e) {
         sync = { ok: false, error: String(e.message || e) };
@@ -60,9 +60,12 @@ module.exports = async function handler(req, res) {
     try {
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
       const result = await syncIndex({
+        mode: body.mode || 'fill',
         newestPages: body.newestPages,
         crawlPages: body.crawlPages,
-        pageSize: body.pageSize,
+        pageSize: body.pageSize || 50,
+        imgConcurrency: body.imgConcurrency || 18,
+        listConcurrency: body.listConcurrency || 6,
       });
       res.status(200).json({ status: 'success', data: result });
     } catch (e) {
