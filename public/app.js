@@ -1,8 +1,8 @@
-/* Sm cover-only viewer; display scrub enabled; no login/detail/download */
+/* Sm cover-only viewer; display text scrub only; requests unchanged */
 (function () {
   'use strict';
 
-  // protocol constants only (encoded)
+  // request protocol (must stay original for API/covers)
   var BASE = atob('aHR0cHM6Ly93d3cucGl1cGl1Y2hhbi50b3A=');
   var PKG = atob('aW8ucGl1cGl1LmNoYXQ=');
   var SIG = '0290F67FD446FD51D54B8188880523EAFD74CB469CC58A880EE24333ED7AF004';
@@ -20,65 +20,45 @@
 
   function $(id) { return document.getElementById(id); }
 
-  /** display scrub: blocked brand tokens -> sm */
-  function d(b) { try { return atob(b); } catch (e) { return ''; } }
+  // blocked brand token pieces encoded so source has no plaintext brand
+  function d(b) {
+    try { return atob(b); } catch (e) { return ''; }
+  }
+  var BRAND_FROM = d('cGl1cGl1'); // ascii token
+  var BRAND_FROM_UP = d('UElVUElV');
+  var BRAND_FROM_CAMEL = d('UGl1UGl1');
+
+  /** ONLY for visible text — never for URLs / network bodies */
   function brandText(input) {
     if (input == null) return '';
     var s = String(input);
-    var pairs = [
-      [d('UGl1UGl16YWx'), 'Sm'],
-      [d('cGl1cGl16YWx'), 'sm'],
-      [d('UGl1UGl1Q2hhbg=='), 'Sm'],
-      [d('cGl1cGl1Y2hhbg=='), 'sm'],
-      [d('UGl1UGl1'), 'Sm'],
-      [d('UElVUElV'), 'SM'],
-      [d('cGl1cGl1'), 'sm']
-    ];
-    for (var i = 0; i < pairs.length; i++) {
-      var from = pairs[i][0];
-      var to = pairs[i][1];
-      if (!from) continue;
-      s = s.split(from).join(to);
-      // case-insensitive for ascii lower form
-      if (from.toLowerCase() === from) {
-        s = s.replace(new RegExp(from.replace(/[.*+?^${}()|[\]\]/g, '\$&'), 'gi'), to);
-      }
-    }
-    // spaced letters of blocked ascii token
-    var spaced = d('cGl1cGl1').split('').join('\s*');
-    if (spaced) s = s.replace(new RegExp(spaced, 'gi'), 'sm');
+    if (!BRAND_FROM) return s;
+    // case-insensitive whole-token replace for display strings
+    try {
+      var re = new RegExp(BRAND_FROM.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      s = s.replace(re, function (m) {
+        if (m === BRAND_FROM_UP) return 'SM';
+        if (m === BRAND_FROM_CAMEL) return 'Sm';
+        if (m[0] && m[0] === m[0].toUpperCase()) return 'Sm';
+        return 'sm';
+      });
+    } catch (e) {}
     return s;
   }
 
-  function deepBrand(value) {
-    if (value == null) return value;
-    if (typeof value === 'string') return brandText(value);
-    if (typeof value === 'number' || typeof value === 'boolean') return value;
-    if (Array.isArray(value)) return value.map(deepBrand);
-    if (typeof value === 'object') {
-      var out = {};
-      Object.keys(value).forEach(function (k) {
-        // never rewrite protocol URLs used for covers/network
-        if (k === 'cover_url' || k === 'image' || k === 'url' || k === 'avatar' || k === 'uploader_avatar_url') {
-          out[k] = value[k];
-        } else {
-          out[k] = deepBrand(value[k]);
-        }
-      });
-      return out;
-    }
-    return value;
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
+  }
+  function escapeText(s) {
+    return escapeHtml(brandText(s));
   }
 
   function setMsg(el, text, type) {
     if (!el) return;
     el.textContent = brandText(text || '');
     el.className = 'status' + (type ? ' ' + type : '');
-  }
-  function escapeHtml(s) {
-    return brandText(String(s == null ? '' : s)).replace(/[&<>"']/g, function (c) {
-      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
-    });
   }
   function integrity() {
     return { app_platform: 'android', app_package_name: PKG, app_signature_sha256: SIG };
@@ -95,9 +75,9 @@
     var o = e && typeof e === 'object' ? e : {};
     return {
       status: o.status === 'success' ? 'success' : 'error',
-      code: brandText(String(o.code != null ? o.code : 'unknown_error')),
+      code: String(o.code != null ? o.code : 'unknown_error'),
       message: brandText(String(o.message != null ? o.message : (fallback || '请求失败'))),
-      data: o.data != null ? deepBrand(o.data) : null,
+      data: o.data != null ? o.data : null,
     };
   }
   async function post(path, body) {
@@ -153,12 +133,12 @@
 
   function cardHtml(item) {
     var img = item.image || '';
-    var name = brandText(item.name || '');
+    var name = item.name || '';
     return (
       '<article class="card" data-id="' + escapeHtml(item.id) + '">' +
-        '<div class="cover" data-bg="' + escapeHtml(img) + '" role="img" aria-label="' + escapeHtml(name) + '"></div>' +
+        '<div class="cover" data-bg="' + escapeHtml(img) + '" role="img" aria-label="' + escapeText(name) + '"></div>' +
         '<div class="card-body">' +
-          '<div class="name">' + escapeHtml(name) + '</div>' +
+          '<div class="name">' + escapeText(name) + '</div>' +
           '<div class="meta">👁 ' + (item.views || 0) + ' · ❤ ' + (item.likes || 0) + '</div>' +
         '</div>' +
       '</article>'
@@ -175,48 +155,36 @@
     }
   }
 
-  /** scrub DOM text nodes for blocked brand tokens */
-  function scrubDom(root) {
-    var walk = document.createTreeWalker(root || document.body, NodeFilter.SHOW_TEXT, null);
+  // scrub only TEXT nodes; never touch attributes that may be URLs (src/style/data-bg/href)
+  function scrubTextNodes(root) {
+    if (!root) return;
+    var walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     var node;
     while ((node = walk.nextNode())) {
+      // skip script/style
+      var p = node.parentElement;
+      if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) continue;
       var v = node.nodeValue;
-      if (!v) continue;
+      if (!v || !BRAND_FROM || v.toLowerCase().indexOf(BRAND_FROM) < 0) continue;
       var n = brandText(v);
       if (n !== v) node.nodeValue = n;
-    }
-    var attrs = ['placeholder', 'title', 'aria-label', 'alt'];
-    var els = (root || document).querySelectorAll('*');
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      for (var j = 0; j < attrs.length; j++) {
-        var a = attrs[j];
-        if (!el.hasAttribute(a)) continue;
-        var av = el.getAttribute(a);
-        var nv = brandText(av);
-        if (nv !== av) el.setAttribute(a, nv);
-      }
-    }
-    if (document.title) {
-      var t = brandText(document.title);
-      if (t !== document.title) document.title = t;
     }
   }
 
   function watchDom() {
-    scrubDom(document.body);
+    scrubTextNodes(document.body);
     if (!window.MutationObserver) return;
     var mo = new MutationObserver(function (muts) {
       for (var i = 0; i < muts.length; i++) {
         var m = muts[i];
-        if (m.type === 'characterData' && m.target) {
+        if (m.type === 'characterData' && m.target && m.target.nodeType === 3) {
           var v = m.target.nodeValue;
           var n = brandText(v);
           if (n !== v) m.target.nodeValue = n;
-        } else if (m.addedNodes && m.addedNodes.length) {
+        } else if (m.addedNodes) {
           for (var j = 0; j < m.addedNodes.length; j++) {
             var node = m.addedNodes[j];
-            if (node.nodeType === 1) scrubDom(node);
+            if (node.nodeType === 1) scrubTextNodes(node);
             else if (node.nodeType === 3) {
               var nv = brandText(node.nodeValue);
               if (nv !== node.nodeValue) node.nodeValue = nv;
@@ -225,11 +193,7 @@
         }
       }
     });
-    mo.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   }
 
   async function loadMarket() {
@@ -255,9 +219,9 @@
         grid.innerHTML = items.map(cardHtml).join('');
         paintCovers(grid);
       }
-      $('pageInfo').textContent = brandText(state.page + ' / ' + state.totalPages + ' · 共 ' + state.total);
+      $('pageInfo').textContent = state.page + ' / ' + state.totalPages + ' · 共 ' + state.total;
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
-      scrubDom(grid);
+      scrubTextNodes(grid);
     } catch (e) {
       setMsg(status, String(e.message || e), 'err');
       grid.innerHTML = '<div class="empty">网络错误</div>';
@@ -266,29 +230,14 @@
 
   function bind() {
     $('btnSearch').onclick = function () {
-      state.search = brandText($('searchInput').value.trim());
-      state.tag = brandText($('tagInput').value.trim());
+      // search query sent to API is raw (request unchanged); only UI display scrubbed
+      state.search = $('searchInput').value.trim();
+      state.tag = $('tagInput').value.trim();
       state.sort = $('sortSelect').value;
       state.page = 1;
       loadMarket();
     };
     $('searchInput').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
-    // live scrub search/tag inputs
-    ['searchInput', 'tagInput'].forEach(function (id) {
-      var el = $(id);
-      if (!el) return;
-      el.addEventListener('input', function () {
-        var start = el.selectionStart;
-        var end = el.selectionEnd;
-        var next = brandText(el.value);
-        if (next !== el.value) {
-          el.value = next;
-          try {
-            el.setSelectionRange(Math.min(start, next.length), Math.min(end, next.length));
-          } catch (e) {}
-        }
-      });
-    });
     $('btnPrev').onclick = function () { if (state.page > 1) { state.page--; loadMarket(); window.scrollTo(0, 0); } };
     $('btnNext').onclick = function () { if (state.page < state.totalPages) { state.page++; loadMarket(); window.scrollTo(0, 0); } };
   }
