@@ -29,6 +29,8 @@
     imgToken: 0,
     indexCount: 0,
     blobEnabled: false,
+    syncBusy: false,
+    autoSyncChecked: false,
     indexMap: Object.create(null), // id -> {id,name,image,ahash,dhash,colors}
   };
 
@@ -455,47 +457,66 @@
     pageSize = pageSize || 50;
     var seed = [];
     var seen = Object.create(null);
-    var oldSort = state.sort;
-    state.sort = '最新';
-    try {
-      for (var p = 1; p <= pages; p++) {
-        var res = await listMarketPage(p, pageSize);
-        if (!res || res.status !== 'success') {
-          throw new Error((res && res.message) || ('列表第' + p + '页失败'));
-        }
-        var data = res.data || {};
-        var items = Array.isArray(data.items) ? data.items : [];
-        for (var i = 0; i < items.length; i++) {
-          var role = items[i];
-          if (!role || role.id == null || seen[String(role.id)]) continue;
-          seen[String(role.id)] = 1;
-          var cover = role.cover_url || role.image || '';
-          if (!cover) continue;
-          seed.push({
-            id: role.id,
-            name: role.name || '',
-            cover_url: cover,
-            view_count: role.view_count != null ? role.view_count : (role.views || 0),
-            like_count: role.like_count != null ? role.like_count : (role.likes || 0),
-          });
-        }
+    for (var p = 1; p <= pages; p++) {
+      var res = await post('/role_market.php', {
+        action: 'list',
+        page: p,
+        page_size: pageSize,
+        sort: mapSort('最新'),
+        tag: '',
+        search: '',
+        device_id: getDeviceId(),
+      });
+      if (!res || res.status !== 'success') {
+        throw new Error((res && res.message) || ('列表第' + p + '页失败'));
       }
-    } finally {
-      state.sort = oldSort;
+      var data = res.data || {};
+      var items = Array.isArray(data.items) ? data.items : [];
+      for (var i = 0; i < items.length; i++) {
+        var role = items[i];
+        if (!role || role.id == null || seen[String(role.id)]) continue;
+        seen[String(role.id)] = 1;
+        var cover = role.cover_url || role.image || '';
+        if (!cover) continue;
+        seed.push({
+          id: role.id,
+          name: role.name || '',
+          cover_url: cover,
+          view_count: role.view_count != null ? role.view_count : (role.views || 0),
+          like_count: role.like_count != null ? role.like_count : (role.likes || 0),
+        });
+      }
     }
     return seed;
   }
 
-  async function manualSyncIndex() {
-    if (state.syncBusy) return;
+  function smartSyncPages(missing) {
+    if (missing <= 0) return 0;
+    if (missing <= 40) return 1;
+    if (missing <= 90) return 2;
+    if (missing <= 140) return 3;
+    return 4;
+  }
+
+  async function autoSyncIndex() {
+    if (state.syncBusy || state.autoSyncChecked) return;
+    state.autoSyncChecked = true;
+    var marketTotal = Number(state.total) || 0;
+    var missing = marketTotal - state.indexCount;
+    var pages = smartSyncPages(missing);
+    if (!state.blobEnabled || !marketTotal) {
+      updateIndexInfo(state.blobEnabled ? '等待市场总数' : 'Blob未配置');
+      return;
+    }
+    if (!pages) {
+      updateIndexInfo('索引已是最新');
+      return;
+    }
     state.syncBusy = true;
-    var btn = $('btnSyncIndex');
-    if (btn) { btn.disabled = true; btn.textContent = '同步中…'; }
     try {
-      updateIndexInfo('同步中…');
-      setMsg($('status'), '浏览器拉取最新封面并上传云端…');
+      updateIndexInfo('后台补齐 ' + missing + ' 条…');
       // Vercel 出口会被 Cloudflare 拦，改由浏览器拉列表，服务端只算特征/写 Blob。
-      var seedItems = await collectNewestSeedItems(2, 50);
+      var seedItems = await collectNewestSeedItems(pages, 50);
       var res = await fetch('/api/cover-index', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -507,18 +528,14 @@
         throw new Error((data && data.message) || ('HTTP ' + res.status));
       }
       var result = data && data.data ? data.data : {};
-      // re-pull full index for IDB
       await loadCloudIndex();
       var added = result.added != null ? result.added : 0;
       var errN = result.errors != null ? result.errors : 0;
-      updateIndexInfo('已同步 +' + added);
-      setMsg($('status'), '索引同步完成 · +' + added + (errN ? (' · 失败 ' + errN) : '') + ' · 共 ' + (result.count != null ? result.count : state.indexCount) + ' 条', errN && !added ? 'err' : 'ok');
+      updateIndexInfo('后台同步 +' + added + (errN ? (' / 失败 ' + errN) : ''));
     } catch (e) {
-      updateIndexInfo('同步失败');
-      setMsg($('status'), '同步失败：' + (e.message || e), 'err');
+      updateIndexInfo('后台同步失败');
     } finally {
       state.syncBusy = false;
-      if (btn) { btn.disabled = false; btn.textContent = '同步索引'; }
     }
   }
   function cancelWork(msg) {
@@ -627,7 +644,7 @@
       return;
     }
     if (state.indexCount < 1) {
-      setMsg($('status'), '本地无索引，请先点「同步索引」', 'err');
+      setMsg($('status'), '云端索引尚未就绪，请稍候后台同步', 'err');
       return;
     }
 
@@ -760,7 +777,7 @@
         var prev = $('imgSearchPreview');
         prev.src = state.imgQueryUrl; prev.classList.remove('hidden');
         state.imgQueryFeat = await featuresFromSrc(state.imgQueryUrl);
-        setMsg($('status'), '图片已就绪：建议先「同步索引」，再「以图搜图」', 'ok');
+        setMsg($('status'), '图片已就绪，可以开始搜图', 'ok');
       } catch (err) {
         state.imgQueryFeat = null;
         setMsg($('status'), '图片读取失败：' + (err.message || err), 'err');
@@ -768,7 +785,6 @@
     };
 
     $('btnImgSearch').onclick = function () { runImageSearch(); };
-    if ($('btnSyncIndex')) $('btnSyncIndex').onclick = function () { manualSyncIndex(); };
     $('btnCancelImg').onclick = function () {
       cancelWork('已取消');
       if (state.mode === 'img' && state.imgResults && state.imgResults.length) {
@@ -788,8 +804,8 @@
     watchDom();
     bind();
     await loadLocalIndex();
-    loadCloudIndex();
-    loadMarket();
+    await Promise.all([loadCloudIndex(), loadMarket()]);
+    autoSyncIndex();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();

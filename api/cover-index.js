@@ -14,7 +14,7 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  // GET: read-only. No auto sync — client must POST manually.
+  // GET stays read-only; the browser compares market/index counts and POSTs seed items in the background.
   if (req.method === 'GET') {
     const blobEnabled = hasBlob();
     const index = blobEnabled ? await readIndex() : emptyIndex();
@@ -22,7 +22,7 @@ module.exports = async function handler(req, res) {
       status: 'success',
       data: {
         blobEnabled,
-        auto: false,
+        auto: true,
         count: index.items ? index.items.length : 0,
         crawl: index.crawl || null,
         updatedAt: index.updatedAt || 0,
@@ -44,7 +44,7 @@ module.exports = async function handler(req, res) {
       const count = prev.items ? prev.items.length : 0;
       let seedItems = Array.isArray(body.seedItems) ? body.seedItems : [];
       // Keep payload small for serverless body limits.
-      if (seedItems.length > 120) seedItems = seedItems.slice(0, 120);
+      if (seedItems.length > 220) seedItems = seedItems.slice(0, 220);
       seedItems = seedItems.map((x) => ({
         id: x && x.id,
         name: x && x.name || '',
