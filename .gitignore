@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.vercel
+node_modules
+.DS_Store
+dev.log
+dev.pid
+*.log
+evidence_market.json

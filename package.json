@@ -1,0 +1,9 @@
+{
+  "name": "fzsm",
+  "version": "1.0.0",
+  "private": true,
+  "description": "fzsm cover-only role market viewer (Vercel)",
+  "engines": {
+    "node": ">=18"
+  }
+}
