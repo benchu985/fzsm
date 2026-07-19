@@ -42,19 +42,33 @@ module.exports = async function handler(req, res) {
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
       const prev = await readIndex();
       const count = prev.items ? prev.items.length : 0;
+      let seedItems = Array.isArray(body.seedItems) ? body.seedItems : [];
+      // Keep payload small for serverless body limits.
+      if (seedItems.length > 120) seedItems = seedItems.slice(0, 120);
+      seedItems = seedItems.map((x) => ({
+        id: x && x.id,
+        name: x && x.name || '',
+        cover_url: (x && (x.cover_url || x.image || x.coverUrl)) || '',
+        view_count: x && (x.view_count != null ? x.view_count : x.views),
+        like_count: x && (x.like_count != null ? x.like_count : x.likes),
+      })).filter((x) => x.id != null && x.cover_url);
+
       let mode = body.mode;
       if (!mode) {
-        if (count < 1) mode = 'fill';
+        if (seedItems.length) mode = 'seed';
+        else if (count < 1) mode = 'fill';
         else if (count < 8000) mode = 'balanced';
         else mode = 'newest';
       }
-      const nearFull = count >= 8000 || mode === 'newest';
+      if (seedItems.length && mode === 'newest') mode = 'seed';
+      const nearFull = count >= 8000 || mode === 'newest' || mode === 'seed';
       const result = await syncIndex({
         mode,
+        seedItems,
         newestPages: body.newestPages != null ? body.newestPages : (nearFull ? 4 : (mode === 'fill' ? 1 : 2)),
-        crawlPages: body.crawlPages != null ? body.crawlPages : (nearFull || mode === 'newest' ? 0 : (mode === 'fill' ? 30 : 12)),
+        crawlPages: body.crawlPages != null ? body.crawlPages : (nearFull || mode === 'newest' || mode === 'seed' ? 0 : (mode === 'fill' ? 30 : 12)),
         pageSize: body.pageSize || 50,
-        imgConcurrency: body.imgConcurrency || 18,
+        imgConcurrency: body.imgConcurrency || (seedItems.length ? 8 : 18),
         listConcurrency: body.listConcurrency || 6,
       });
       res.status(200).json({ status: 'success', data: result });

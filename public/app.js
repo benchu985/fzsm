@@ -450,6 +450,42 @@
       return false;
     }
   }
+  async function collectNewestSeedItems(pages, pageSize) {
+    pages = Math.max(1, Math.min(4, pages || 2));
+    pageSize = pageSize || 50;
+    var seed = [];
+    var seen = Object.create(null);
+    var oldSort = state.sort;
+    state.sort = '最新';
+    try {
+      for (var p = 1; p <= pages; p++) {
+        var res = await listMarketPage(p, pageSize);
+        if (!res || res.status !== 'success') {
+          throw new Error((res && res.message) || ('列表第' + p + '页失败'));
+        }
+        var data = res.data || {};
+        var items = Array.isArray(data.items) ? data.items : [];
+        for (var i = 0; i < items.length; i++) {
+          var role = items[i];
+          if (!role || role.id == null || seen[String(role.id)]) continue;
+          seen[String(role.id)] = 1;
+          var cover = role.cover_url || role.image || '';
+          if (!cover) continue;
+          seed.push({
+            id: role.id,
+            name: role.name || '',
+            cover_url: cover,
+            view_count: role.view_count != null ? role.view_count : (role.views || 0),
+            like_count: role.like_count != null ? role.like_count : (role.likes || 0),
+          });
+        }
+      }
+    } finally {
+      state.sort = oldSort;
+    }
+    return seed;
+  }
+
   async function manualSyncIndex() {
     if (state.syncBusy) return;
     state.syncBusy = true;
@@ -457,11 +493,13 @@
     if (btn) { btn.disabled = true; btn.textContent = '同步中…'; }
     try {
       updateIndexInfo('同步中…');
-      setMsg($('status'), '正在同步云端索引（仅抓新图）…');
+      setMsg($('status'), '浏览器拉取最新封面并上传云端…');
+      // Vercel 出口会被 Cloudflare 拦，改由浏览器拉列表，服务端只算特征/写 Blob。
+      var seedItems = await collectNewestSeedItems(2, 50);
       var res = await fetch('/api/cover-index', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: state.indexCount >= 8000 ? 'newest' : (state.indexCount < 1 ? 'fill' : 'balanced') }),
+        body: JSON.stringify({ mode: 'seed', seedItems: seedItems }),
         cache: 'no-store',
       });
       var data = await res.json();
@@ -472,8 +510,9 @@
       // re-pull full index for IDB
       await loadCloudIndex();
       var added = result.added != null ? result.added : 0;
+      var errN = result.errors != null ? result.errors : 0;
       updateIndexInfo('已同步 +' + added);
-      setMsg($('status'), '索引同步完成 · +' + added + ' · 共 ' + (result.count != null ? result.count : state.indexCount) + ' 条', 'ok');
+      setMsg($('status'), '索引同步完成 · +' + added + (errN ? (' · 失败 ' + errN) : '') + ' · 共 ' + (result.count != null ? result.count : state.indexCount) + ' 条', errN && !added ? 'err' : 'ok');
     } catch (e) {
       updateIndexInfo('同步失败');
       setMsg($('status'), '同步失败：' + (e.message || e), 'err');
