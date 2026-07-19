@@ -27,16 +27,14 @@ npx vercel --prod
 
 ## 云端自动索引
 
-- **每 10 分钟自动同步最新封面**（GitHub Actions → `/api/cron-sync-index`）
-  - 工作流：`.github/workflows/sync-index.yml`
-  - 刷新最新 5 页封面（约 250 条范围）并写入 Blob 索引
-  - 也可在 Actions 页手动 `workflow_dispatch`
-- Vercel Cron 每日 04:00 UTC 兜底一次（Hobby 套餐不支持亚日级 cron）
-- 前端打开自动拉 `/api/cover-index`（只读，不触发同步）
-- 也可点「同步索引」手动立即刷新
+- Vercel Cron 每 10 分钟：`/api/cron-sync-index`
+  - 刷新最新页（新图）
+  - 继续全库爬取并写入 Blob 索引
+- 前端打开自动拉 `/api/cover-index`
+  - 空索引/过期时服务端自动补同步
+  - **无需手动更新索引**
 - 以图搜图只比对云端索引，低相似直接丢弃
 
 环境变量：
 - `BLOB_READ_WRITE_TOKEN`（已配置）
-- 可选 `CRON_SECRET`（若设置，需同步配置 GitHub Secret `CRON_SECRET`）
-
+- 可选 `CRON_SECRET`
