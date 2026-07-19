@@ -80,3 +80,20 @@ body { min-height: 100dvh; }
 }
 .page-input::-webkit-outer-spin-button,
 .page-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.img-search-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin: 0 0 10px; padding: 10px; border: 1px solid var(--line); border-radius: 12px;
+  background: rgba(255,255,255,.03);
+}
+.file-btn { position: relative; overflow: hidden; display: inline-flex; align-items: center; }
+.img-preview {
+  width: 44px; height: 58px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line);
+}
+.img-preview.hidden, .hidden { display: none !important; }
+.scan-label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+.score-pill {
+  display: inline-block; margin-top: 4px; font-size: 11px; font-weight: 700;
+  color: #1a0a12; background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border-radius: 999px; padding: 2px 8px;
+}
+.card.rank-1 { box-shadow: 0 0 0 1px rgba(255,111,174,.55); }

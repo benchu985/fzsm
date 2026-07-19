@@ -1,8 +1,7 @@
-/* Sm cover-only viewer; display text scrub only; requests unchanged */
+/* Sm cover-only viewer; text scrub on display only; image similarity search */
 (function () {
   'use strict';
 
-  // request protocol (must stay original for API/covers)
   var BASE = atob('aHR0cHM6Ly93d3cucGl1cGl1Y2hhbi50b3A=');
   var PKG = atob('aW8ucGl1cGl1LmNoYXQ=');
   var SIG = '0290F67FD446FD51D54B8188880523EAFD74CB469CC58A880EE24333ED7AF004';
@@ -16,24 +15,23 @@
     search: '',
     totalPages: 1,
     total: 0,
+    mode: 'browse', // browse | img
+    imgQueryFeat: null,
+    imgQueryUrl: '',
+    imgResults: [],
+    imgBusy: false,
   };
 
   function $(id) { return document.getElementById(id); }
-
-  // blocked brand token pieces encoded so source has no plaintext brand
-  function d(b) {
-    try { return atob(b); } catch (e) { return ''; }
-  }
-  var BRAND_FROM = d('cGl1cGl1'); // ascii token
+  function d(b) { try { return atob(b); } catch (e) { return ''; } }
+  var BRAND_FROM = d('cGl1cGl1');
   var BRAND_FROM_UP = d('UElVUElV');
   var BRAND_FROM_CAMEL = d('UGl1UGl1');
 
-  /** ONLY for visible text — never for URLs / network bodies */
   function brandText(input) {
     if (input == null) return '';
     var s = String(input);
     if (!BRAND_FROM) return s;
-    // case-insensitive whole-token replace for display strings
     try {
       var re = new RegExp(BRAND_FROM.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
       s = s.replace(re, function (m) {
@@ -45,16 +43,12 @@
     } catch (e) {}
     return s;
   }
-
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
     });
   }
-  function escapeText(s) {
-    return escapeHtml(brandText(s));
-  }
-
+  function escapeText(s) { return escapeHtml(brandText(s)); }
   function setMsg(el, text, type) {
     if (!el) return;
     el.textContent = brandText(text || '');
@@ -118,33 +112,150 @@
       likes: role.like_count != null ? role.like_count : (role.likes || 0),
     };
   }
-
-  async function listMarket() {
+  async function listMarketPage(page, pageSize) {
     return post('/role_market.php', {
       action: 'list',
-      page: state.page,
-      page_size: state.pageSize,
+      page: page,
+      page_size: pageSize || state.pageSize,
       sort: mapSort(state.sort),
       tag: state.tag || '',
       search: state.search || '',
       device_id: getDeviceId(),
     });
   }
+  async function listMarket() {
+    return listMarketPage(state.page, state.pageSize);
+  }
+
+  /* ---------- image features: aHash(8x8) + color grid(4x4 RGB means) ---------- */
+  function loadImageEl(src) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('image load failed')); };
+      img.src = src;
+    });
+  }
+  function extractFeaturesFromImage(img) {
+    var c = document.createElement('canvas');
+    c.width = 32;
+    c.height = 32;
+    var ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, 32, 32);
+    var data = ctx.getImageData(0, 0, 32, 32).data;
+
+    // aHash on 8x8 grayscale averages of 4x4 blocks
+    var gray8 = [];
+    var y, x, by, bx, i, sum, cnt, gy, gx, idx, r, g, b, gray;
+    for (y = 0; y < 8; y++) {
+      for (x = 0; x < 8; x++) {
+        sum = 0; cnt = 0;
+        for (by = 0; by < 4; by++) {
+          for (bx = 0; bx < 4; bx++) {
+            gy = y * 4 + by;
+            gx = x * 4 + bx;
+            idx = (gy * 32 + gx) * 4;
+            r = data[idx]; g = data[idx + 1]; b = data[idx + 2];
+            gray = 0.299 * r + 0.587 * g + 0.114 * b;
+            sum += gray; cnt++;
+          }
+        }
+        gray8.push(sum / cnt);
+      }
+    }
+    var avg = 0;
+    for (i = 0; i < gray8.length; i++) avg += gray8[i];
+    avg /= gray8.length;
+    var ahash = [];
+    for (i = 0; i < gray8.length; i++) ahash.push(gray8[i] >= avg ? 1 : 0);
+
+    // 4x4 mean RGB (each cell 8x8 on 32 canvas)
+    var colors = [];
+    for (y = 0; y < 4; y++) {
+      for (x = 0; x < 4; x++) {
+        var sr = 0, sg = 0, sb = 0; cnt = 0;
+        for (by = 0; by < 8; by++) {
+          for (bx = 0; bx < 8; bx++) {
+            gy = y * 8 + by;
+            gx = x * 8 + bx;
+            idx = (gy * 32 + gx) * 4;
+            sr += data[idx]; sg += data[idx + 1]; sb += data[idx + 2]; cnt++;
+          }
+        }
+        colors.push(sr / cnt, sg / cnt, sb / cnt);
+      }
+    }
+    return { ahash: ahash, colors: colors };
+  }
+  async function featuresFromSrc(src) {
+    var img = await loadImageEl(src);
+    return extractFeaturesFromImage(img);
+  }
+  function hamming(a, b) {
+    var d = 0;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+    return d;
+  }
+  function colorDistance(a, b) {
+    // normalized L1 over 0..255 channels
+    var s = 0;
+    for (var i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+    return s / (a.length * 255);
+  }
+  function similarityScore(q, t) {
+    // 0..100, higher better
+    var ham = hamming(q.ahash, t.ahash); // 0..64
+    var hashSim = 1 - ham / 64;
+    var colSim = 1 - colorDistance(q.colors, t.colors);
+    var score = 0.62 * hashSim + 0.38 * colSim;
+    return Math.max(0, Math.min(1, score)) * 100;
+  }
+
+  function mapPool(items, limit, worker) {
+    return new Promise(function (resolve) {
+      var out = new Array(items.length);
+      var i = 0, active = 0, done = 0;
+      function next() {
+        while (active < limit && i < items.length) {
+          (function (idx) {
+            active++;
+            Promise.resolve(worker(items[idx], idx))
+              .then(function (v) { out[idx] = v; })
+              .catch(function () { out[idx] = null; })
+              .then(function () {
+                active--; done++;
+                if (done === items.length) resolve(out);
+                else next();
+              });
+          })(i++);
+        }
+      }
+      if (!items.length) resolve([]);
+      else next();
+    });
+  }
 
   function cardHtml(item) {
     var img = item.image || '';
     var name = item.name || '';
+    var scoreHtml = '';
+    var rankClass = '';
+    if (item.score != null) {
+      scoreHtml = '<div class="score-pill">相关 ' + Math.round(item.score) + '%</div>';
+      if (item._rank === 1) rankClass = ' rank-1';
+    }
     return (
-      '<article class="card" data-id="' + escapeHtml(item.id) + '">' +
+      '<article class="card' + rankClass + '" data-id="' + escapeHtml(item.id) + '">' +
         '<div class="cover" data-bg="' + escapeHtml(img) + '" role="img" aria-label="' + escapeText(name) + '"></div>' +
         '<div class="card-body">' +
           '<div class="name">' + escapeText(name) + '</div>' +
           '<div class="meta">👁 ' + (item.views || 0) + ' · ❤ ' + (item.likes || 0) + '</div>' +
+          scoreHtml +
         '</div>' +
       '</article>'
     );
   }
-
   function paintCovers(root) {
     var nodes = (root || document).querySelectorAll('.cover[data-bg]');
     for (var i = 0; i < nodes.length; i++) {
@@ -154,23 +265,19 @@
       el.removeAttribute('data-bg');
     }
   }
-
-  // scrub only TEXT nodes; never touch attributes that may be URLs (src/style/data-bg/href)
   function scrubTextNodes(root) {
-    if (!root) return;
+    if (!root || !BRAND_FROM) return;
     var walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     var node;
     while ((node = walk.nextNode())) {
-      // skip script/style
       var p = node.parentElement;
       if (p && (p.tagName === 'SCRIPT' || p.tagName === 'STYLE')) continue;
       var v = node.nodeValue;
-      if (!v || !BRAND_FROM || v.toLowerCase().indexOf(BRAND_FROM) < 0) continue;
+      if (!v || v.toLowerCase().indexOf(BRAND_FROM) < 0) continue;
       var n = brandText(v);
       if (n !== v) node.nodeValue = n;
     }
   }
-
   function watchDom() {
     scrubTextNodes(document.body);
     if (!window.MutationObserver) return;
@@ -196,7 +303,113 @@
     mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   }
 
+  function setImgModeUI(on) {
+    var clearBtn = $('btnClearImgSearch');
+    var pager = $('pager');
+    if (clearBtn) clearBtn.classList.toggle('hidden', !on);
+    if (pager) pager.style.display = on ? 'none' : '';
+  }
+
+  function renderImgResults(list) {
+    var grid = $('grid');
+    if (!list.length) {
+      grid.innerHTML = '<div class="empty">未找到相似封面（可增大扫描页数或换图）</div>';
+      return;
+    }
+    // highest relevance first (already sorted)
+    var top = list.slice(0, 60);
+    top.forEach(function (it, idx) { it._rank = idx + 1; });
+    grid.innerHTML = top.map(cardHtml).join('');
+    paintCovers(grid);
+    scrubTextNodes(grid);
+  }
+
+  async function runImageSearch() {
+    if (state.imgBusy) return;
+    if (!state.imgQueryFeat) {
+      setMsg($('status'), '请先选择一张图片', 'err');
+      return;
+    }
+    var scanPages = parseInt(($('imgScanPages') && $('imgScanPages').value) || '8', 10);
+    if (!isFinite(scanPages) || scanPages < 1) scanPages = 8;
+    if (scanPages > 50) scanPages = 50;
+
+    state.imgBusy = true;
+    state.mode = 'img';
+    setImgModeUI(true);
+    var status = $('status');
+    var grid = $('grid');
+    grid.innerHTML = '<div class="empty">搜图中…</div>';
+
+    try {
+      // use current filters
+      state.search = $('searchInput').value.trim();
+      state.tag = $('tagInput').value.trim();
+      state.sort = $('sortSelect').value;
+
+      var pageSize = 24;
+      var all = [];
+      var seen = {};
+      var totalPages = scanPages;
+
+      for (var p = 1; p <= scanPages; p++) {
+        setMsg(status, '拉取列表 ' + p + '/' + scanPages + ' …');
+        var r = await listMarketPage(p, pageSize);
+        if (r.status !== 'success') {
+          setMsg(status, r.message || ('第 ' + p + ' 页失败'), 'err');
+          break;
+        }
+        var data = r.data || {};
+        var tp = Number(data.total_pages != null ? data.total_pages : data.totalPages) || scanPages;
+        if (tp > 0 && tp < totalPages) totalPages = tp;
+        if (p > totalPages) break;
+        var raw = Array.isArray(data.items) ? data.items : [];
+        for (var i = 0; i < raw.length; i++) {
+          var role = sanitizeRole(raw[i]);
+          if (!role || !role.image) continue;
+          var key = String(role.id);
+          if (seen[key]) continue;
+          seen[key] = 1;
+          all.push(role);
+        }
+        if (p >= totalPages) break;
+      }
+
+      setMsg(status, '比对封面 0/' + all.length + ' …');
+      var done = 0;
+      var scored = await mapPool(all, 6, async function (item) {
+        try {
+          var feat = await featuresFromSrc(item.image);
+          item.score = similarityScore(state.imgQueryFeat, feat);
+        } catch (e) {
+          item.score = -1;
+        }
+        done++;
+        if (done % 4 === 0 || done === all.length) {
+          setMsg(status, '比对封面 ' + done + '/' + all.length + ' …');
+        }
+        return item;
+      });
+
+      scored = scored.filter(function (x) { return x && x.score >= 0; });
+      scored.sort(function (a, b) { return b.score - a.score; }); // 相关性最高放前面
+      state.imgResults = scored;
+      renderImgResults(scored);
+      var best = scored[0] ? Math.round(scored[0].score) : 0;
+      setMsg(status, '搜图完成：扫描 ' + all.length + ' 张，按相关度排序（最高 ' + best + '%）', 'ok');
+    } catch (e) {
+      setMsg(status, String(e.message || e), 'err');
+      grid.innerHTML = '<div class="empty">搜图失败</div>';
+    } finally {
+      state.imgBusy = false;
+    }
+  }
+
   async function loadMarket() {
+    if (state.mode === 'img') {
+      // browsing returns from img mode only via clear
+      return;
+    }
     var status = $('status');
     var grid = $('grid');
     setMsg(status, '加载中…');
@@ -235,16 +448,8 @@
   }
 
   function bind() {
-    $('btnSearch').onclick = function () {
-      // search query sent to API is raw (request unchanged); only UI display scrubbed
-      state.search = $('searchInput').value.trim();
-      state.tag = $('tagInput').value.trim();
-      state.sort = $('sortSelect').value;
-      state.page = 1;
-      loadMarket();
-    };
-    $('searchInput').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
     function goPage(raw) {
+      if (state.mode === 'img') return;
       var n = parseInt(raw, 10);
       if (!isFinite(n)) {
         setMsg($('status'), '请输入有效页码', 'err');
@@ -260,10 +465,49 @@
       loadMarket();
       window.scrollTo(0, 0);
     }
+
+    $('btnSearch').onclick = function () {
+      state.search = $('searchInput').value.trim();
+      state.tag = $('tagInput').value.trim();
+      state.sort = $('sortSelect').value;
+      state.page = 1;
+      if (state.mode === 'img' && state.imgQueryFeat) {
+        runImageSearch();
+        return;
+      }
+      state.mode = 'browse';
+      setImgModeUI(false);
+      loadMarket();
+    };
+    $('searchInput').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
     $('btnPrev').onclick = function () { if (state.page > 1) { state.page--; loadMarket(); window.scrollTo(0, 0); } };
     $('btnNext').onclick = function () { if (state.page < state.totalPages) { state.page++; loadMarket(); window.scrollTo(0, 0); } };
     $('btnGoPage').onclick = function () { goPage($('pageInput').value); };
     $('pageInput').onkeydown = function (e) { if (e.key === 'Enter') goPage($('pageInput').value); };
+
+    $('imgSearchFile').onchange = async function (e) {
+      var file = e.target.files && e.target.files[0];
+      if (!file) return;
+      try {
+        if (state.imgQueryUrl) URL.revokeObjectURL(state.imgQueryUrl);
+        state.imgQueryUrl = URL.createObjectURL(file);
+        var prev = $('imgSearchPreview');
+        prev.src = state.imgQueryUrl;
+        prev.classList.remove('hidden');
+        state.imgQueryFeat = await featuresFromSrc(state.imgQueryUrl);
+        setMsg($('status'), '图片已就绪，点击「以图搜图」', 'ok');
+      } catch (err) {
+        state.imgQueryFeat = null;
+        setMsg($('status'), '图片读取失败：' + (err.message || err), 'err');
+      }
+    };
+    $('btnImgSearch').onclick = function () { runImageSearch(); };
+    $('btnClearImgSearch').onclick = function () {
+      state.mode = 'browse';
+      state.imgResults = [];
+      setImgModeUI(false);
+      loadMarket();
+    };
   }
 
   function boot() {

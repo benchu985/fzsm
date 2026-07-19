@@ -31,9 +31,23 @@
         </select>
         <button type="button" class="btn primary" id="btnSearch">查询</button>
       </div>
+
+      <div class="img-search-row">
+        <label class="file-btn btn ghost">
+          选择图片
+          <input id="imgSearchFile" type="file" accept="image/*" hidden />
+        </label>
+        <img id="imgSearchPreview" class="img-preview hidden" alt="query" />
+        <label class="scan-label">扫描页数
+          <input class="field page-input" id="imgScanPages" type="number" min="1" max="50" value="8" inputmode="numeric" />
+        </label>
+        <button type="button" class="btn primary" id="btnImgSearch">以图搜图</button>
+        <button type="button" class="btn ghost hidden" id="btnClearImgSearch">退出搜图</button>
+      </div>
+
       <div id="status" class="status"></div>
       <div class="grid" id="grid"></div>
-      <div class="pager">
+      <div class="pager" id="pager">
         <button type="button" class="btn ghost" id="btnPrev">上一页</button>
         <span class="page-pill" id="pageInfo">-</span>
         <button type="button" class="btn ghost" id="btnNext">下一页</button>
