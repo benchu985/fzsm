@@ -22,8 +22,9 @@
     totalPages: 1,
     total: 0,
     mode: 'browse', // browse | img
-    imgQueryFeat: null,
-    imgQueryUrl: '',
+    imgQueries: [], // [{url,name,feat}]
+    activeImgQuery: 0,
+    imgResultsByQuery: [],
     imgResults: [],
     imgBusy: false,
     imgToken: 0,
@@ -623,6 +624,43 @@
     if (clearBtn) clearBtn.classList.toggle('hidden', !on);
     if (pager) pager.style.display = on ? 'none' : '';
   }
+  function renderQueryStrip() {
+    var strip = $('imgQueryStrip');
+    var clear = $('btnClearUploads');
+    if (!strip) return;
+    var has = state.imgQueries.length > 0;
+    strip.classList.toggle('hidden', !has);
+    if (clear) clear.classList.toggle('hidden', !has);
+    strip.innerHTML = '';
+    if (!has) return;
+    for (var i = 0; i < state.imgQueries.length; i++) {
+      (function (idx) {
+        var q = state.imgQueries[idx];
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'query-thumb' + (idx === state.activeImgQuery ? ' active' : '');
+        btn.title = q.name || ('图片 ' + (idx + 1));
+        var img = document.createElement('img');
+        img.src = q.url;
+        img.alt = q.name || ('图片 ' + (idx + 1));
+        btn.appendChild(img);
+        var count = document.createElement('span');
+        count.className = 'query-thumb-count';
+        count.textContent = state.imgResultsByQuery[idx] ? String(state.imgResultsByQuery[idx].length) : String(idx + 1);
+        btn.appendChild(count);
+        btn.onclick = function () {
+          state.activeImgQuery = idx;
+          renderQueryStrip();
+          if (state.mode === 'img' && state.imgResultsByQuery[idx]) {
+            state.imgResults = state.imgResultsByQuery[idx];
+            renderImgResults(state.imgResults);
+            setMsg($('status'), '正在查看第 ' + (idx + 1) + ' 张图片的结果 · ' + state.imgResults.length + ' 个', 'ok');
+          }
+        };
+        strip.appendChild(btn);
+      })(i);
+    }
+  }
   function renderImgResults(list) {
     var grid = $('grid');
     if (!list.length) {
@@ -639,7 +677,7 @@
   /* ---------- search against index (no re-download) ---------- */
   async function runImageSearch() {
     if (state.imgBusy) return;
-    if (!state.imgQueryFeat) {
+    if (!state.imgQueries.length) {
       setMsg($('status'), '请先选择一张图片', 'err');
       return;
     }
@@ -659,9 +697,8 @@
 
     try {
       var minScore = getMinScore();
-      var q = state.imgQueryFeat;
       var ids = Object.keys(state.indexMap);
-      var live = [];
+      var results = state.imgQueries.map(function () { return []; });
       var t0 = Date.now();
       var checked = 0, passedHash = 0;
 
@@ -670,31 +707,39 @@
         if (token !== state.imgToken) return;
         var it = state.indexMap[ids[i]];
         checked++;
-        var hs = hashSimilarity(q, it);
-        if (hs < HASH_GATE) continue; // 低相似直接丢弃，不算颜色
-        passedHash++;
-        var score = similarityScore(q, it);
-        if (score < minScore) continue; // 只保留高相似
-        live.push({
-          id: it.id,
-          name: it.name,
-          image: it.image,
-          views: it.views || 0,
-          likes: it.likes || 0,
-          score: score,
-        });
+        for (var qi = 0; qi < state.imgQueries.length; qi++) {
+          var q = state.imgQueries[qi].feat;
+          var hs = hashSimilarity(q, it);
+          if (hs < HASH_GATE) continue;
+          passedHash++;
+          var score = similarityScore(q, it);
+          if (score < minScore) continue;
+          results[qi].push({
+            id: it.id,
+            name: it.name,
+            image: it.image,
+            views: it.views || 0,
+            likes: it.likes || 0,
+            score: score,
+          });
+        }
         if (checked % 200 === 0) {
-          setMsg(status, '索引比对 ' + checked + '/' + ids.length + ' · 高相似 ' + live.length);
+          var currentCount = results[state.activeImgQuery].length;
+          setMsg(status, '索引比对 ' + checked + '/' + ids.length + ' · 当前图片命中 ' + currentCount);
           await new Promise(function (r) { setTimeout(r, 0); });
         }
       }
       if (token !== state.imgToken) return;
-      live.sort(function (a, b) { return b.score - a.score; });
+      for (var ri = 0; ri < results.length; ri++) results[ri].sort(function (a, b) { return b.score - a.score; });
+      state.imgResultsByQuery = results;
+      state.activeImgQuery = Math.min(state.activeImgQuery, results.length - 1);
+      var live = results[state.activeImgQuery] || [];
       state.imgResults = live;
+      renderQueryStrip();
       renderImgResults(live);
       var best = live[0] ? Math.round(live[0].score) : 0;
       var sec = ((Date.now() - t0) / 1000).toFixed(2);
-      setMsg(status, '完成：索引 ' + checked + ' · 粗筛通过 ' + passedHash + ' · 高相似 ' + live.length + ' · 最高 ' + best + '% · ' + sec + 's', 'ok');
+      setMsg(status, '完成：' + state.imgQueries.length + ' 张图片 · 当前结果 ' + live.length + ' · 最高 ' + best + '% · ' + sec + 's', 'ok');
     } catch (e) {
       if (token === state.imgToken) {
         setMsg(status, String(e.message || e), 'err');
@@ -744,6 +789,19 @@
   }
 
   function bind() {
+    function clearUploadedImages() {
+      for (var i = 0; i < state.imgQueries.length; i++) {
+        try { URL.revokeObjectURL(state.imgQueries[i].url); } catch (e) {}
+      }
+      state.imgQueries = [];
+      state.imgResultsByQuery = [];
+      state.imgResults = [];
+      state.activeImgQuery = 0;
+      var input = $('imgSearchFile');
+      if (input) input.value = '';
+      renderQueryStrip();
+    }
+
     function goPage(raw) {
       if (state.mode === 'img') return;
       var n = parseInt(raw, 10);
@@ -769,22 +827,43 @@
     $('pageInput').onkeydown = function (e) { if (e.key === 'Enter') goPage($('pageInput').value); };
 
     $('imgSearchFile').onchange = async function (e) {
-      var file = e.target.files && e.target.files[0];
-      if (!file) return;
+      var files = Array.prototype.slice.call((e.target && e.target.files) || []).slice(0, 12);
+      if (!files.length) return;
+      clearUploadedImages();
+      var failed = 0;
       try {
-        if (state.imgQueryUrl) URL.revokeObjectURL(state.imgQueryUrl);
-        state.imgQueryUrl = URL.createObjectURL(file);
-        var prev = $('imgSearchPreview');
-        prev.src = state.imgQueryUrl; prev.classList.remove('hidden');
-        state.imgQueryFeat = await featuresFromSrc(state.imgQueryUrl);
-        setMsg($('status'), '图片已就绪，可以开始搜图', 'ok');
+        for (var i = 0; i < files.length; i++) {
+          setMsg($('status'), '正在读取图片 ' + (i + 1) + '/' + files.length + '…');
+          var url = URL.createObjectURL(files[i]);
+          try {
+            var feat = await featuresFromSrc(url);
+            state.imgQueries.push({ url: url, name: files[i].name || ('图片 ' + (i + 1)), feat: feat });
+            renderQueryStrip();
+          } catch (oneErr) {
+            failed++;
+            URL.revokeObjectURL(url);
+          }
+        }
+        if (!state.imgQueries.length) throw new Error('所选图片读取失败');
+        setMsg($('status'), '已上传 ' + state.imgQueries.length + ' 张图片' + (failed ? (' · 失败 ' + failed) : '') + '，可以开始搜图', failed ? 'err' : 'ok');
       } catch (err) {
-        state.imgQueryFeat = null;
+        clearUploadedImages();
         setMsg($('status'), '图片读取失败：' + (err.message || err), 'err');
       }
     };
 
     $('btnImgSearch').onclick = function () { runImageSearch(); };
+    $('btnClearUploads').onclick = function () {
+      cancelWork();
+      clearUploadedImages();
+      if (state.mode === 'img') {
+        state.mode = 'browse';
+        setImgModeUI(false);
+        loadMarket();
+      } else {
+        setMsg($('status'), '已清空上传图片', 'ok');
+      }
+    };
     $('btnCancelImg').onclick = function () {
       cancelWork('已取消');
       if (state.mode === 'img' && state.imgResults && state.imgResults.length) {
