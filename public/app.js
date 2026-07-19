@@ -371,7 +371,11 @@
     if (!el) return;
     var crawl = state.crawl || {};
     var prog = '';
-    if (crawl.totalPages) prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages;
+    if (state.indexCount >= 8000) {
+      prog = ' · 仅同步新图';
+    } else if (crawl.totalPages) {
+      prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages;
+    }
     el.textContent = '云端索引：' + state.indexCount + ' 条' + prog +
       (state.indexUpdatedAt ? (' · 更新 ' + fmtTime(state.indexUpdatedAt)) : '') +
       (extra ? (' · ' + extra) : '');
@@ -401,7 +405,7 @@
         refreshIndexMap(items);
       }
       var sync = data && data.data && data.data.sync;
-      var extra = state.blobEnabled ? '自动同步' : 'Blob未配置';
+      var extra = state.blobEnabled ? (state.indexCount >= 8000 ? '自动同步新图' : '自动同步') : 'Blob未配置';
       if (sync && sync.ok) extra = '已刷新 +' + (sync.added || 0);
       if (sync && sync.ok === false) extra = '同步失败';
       updateIndexInfo(extra);
@@ -417,14 +421,9 @@
     loadCloudIndex(state.indexCount < 1).then(function () {
       // then soft refresh every 3 minutes
       setInterval(function () {
-        // keep pumping cloud fill while incomplete
-        var incomplete = state.crawl && state.crawl.totalPages && state.crawl.nextPage && state.crawl.nextPage <= state.crawl.totalPages;
+        // index nearly full: only soft-refresh newest via GET ?sync=1
         loadCloudIndex(true);
-        if (incomplete || state.indexCount < 8000) {
-          // also kick server fill endpoint (fire-and-forget)
-          fetch('/api/cover-index', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'fill', crawlPages: 30, pageSize: 50 }) }).catch(function(){});
-        }
-      }, 60 * 1000);
+      }, 3 * 60 * 1000);
     });
   }
   function cancelWork(msg) {

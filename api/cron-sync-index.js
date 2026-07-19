@@ -18,7 +18,8 @@ module.exports = async function handler(req, res) {
 
   try {
     // frequent: refresh newest + advance full crawl
-    const result = await syncIndex({ mode: 'fill', newestPages: 2, crawlPages: 40, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
+    // daily: only pick up newly published covers
+    const result = await syncIndex({ mode: 'newest', newestPages: 5, crawlPages: 0, pageSize: 50, imgConcurrency: 16, listConcurrency: 4 });
     res.status(200).json({ status: 'success', data: result });
   } catch (e) {
     res.status(500).json({ status: 'error', message: String(e.message || e) });

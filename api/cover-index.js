@@ -31,7 +31,16 @@ module.exports = async function handler(req, res) {
     // empty always try; or client asked; or stale
     if (blobEnabled && (empty || wantSync || stale)) {
       try {
-        sync = await syncIndex({ mode: empty ? 'fill' : 'balanced', newestPages: empty ? 1 : 2, crawlPages: empty ? 35 : 18, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
+        const count = index.items ? index.items.length : 0;
+        // near-complete library: only refresh newest pages (new uploads)
+        const nearFull = count >= 8000;
+        if (empty) {
+          sync = await syncIndex({ mode: 'fill', newestPages: 1, crawlPages: 35, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
+        } else if (nearFull) {
+          sync = await syncIndex({ mode: 'newest', newestPages: 3, crawlPages: 0, pageSize: 50, imgConcurrency: 16, listConcurrency: 4 });
+        } else {
+          sync = await syncIndex({ mode: 'balanced', newestPages: 2, crawlPages: 12, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
+        }
         index = await readIndex();
       } catch (e) {
         sync = { ok: false, error: String(e.message || e) };
@@ -60,7 +69,7 @@ module.exports = async function handler(req, res) {
     try {
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
       const result = await syncIndex({
-        mode: body.mode || 'fill',
+        mode: body.mode || 'newest',
         newestPages: body.newestPages,
         crawlPages: body.crawlPages,
         pageSize: body.pageSize || 50,
