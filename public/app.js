@@ -405,7 +405,7 @@
         await idbPutMany(items);
         refreshIndexMap(items);
       }
-      var extra = state.blobEnabled ? '手动同步' : 'Blob未配置';
+      var extra = state.blobEnabled ? '已读取云端' : 'Blob未配置';
       updateIndexInfo(extra);
       return true;
     } catch (e) {

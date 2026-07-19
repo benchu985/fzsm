@@ -2,6 +2,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "cleanUrls": true,
   "trailingSlash": false,
+  "crons": [
+    {
+      "path": "/api/cron-sync-index",
+      "schedule": "0 4 * * *"
+    }
+  ],
   "headers": [
     {
       "source": "/(.*)",

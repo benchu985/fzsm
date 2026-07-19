@@ -1,0 +1,31 @@
+const { syncIndex, hasBlob } = require('../lib/cover-index-server');
+
+module.exports = async function handler(req, res) {
+  // Vercel Cron sends GET with Authorization: Bearer <CRON_SECRET> if set
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    const auth = req.headers.authorization || '';
+    if (auth !== 'Bearer ' + cronSecret) {
+      res.status(401).json({ status: 'error', message: 'unauthorized' });
+      return;
+    }
+  }
+
+  if (!hasBlob()) {
+    res.status(501).json({ status: 'error', message: 'blob_not_configured' });
+    return;
+  }
+
+  try {
+    // frequent: refresh newest + advance full crawl
+    // daily: only pick up newly published covers
+    const result = await syncIndex({ mode: 'newest', newestPages: 5, crawlPages: 0, pageSize: 50, imgConcurrency: 16, listConcurrency: 4 });
+    res.status(200).json({ status: 'success', data: result });
+  } catch (e) {
+    res.status(500).json({ status: 'error', message: String(e.message || e) });
+  }
+};
+
+module.exports.config = {
+  maxDuration: 60,
+};
