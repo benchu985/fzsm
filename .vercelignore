@@ -1,0 +1,9 @@
+.git
+.env*
+node_modules
+*.log
+*.pid
+_*.json
+cover-index.full.json
+cover-index.progress.json
+scripts/__pycache__
