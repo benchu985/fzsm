@@ -14,48 +14,20 @@ module.exports = async function handler(req, res) {
     return;
   }
 
+  // GET: read-only. No auto sync — client must POST manually.
   if (req.method === 'GET') {
     const blobEnabled = hasBlob();
-    let index = blobEnabled ? await readIndex() : emptyIndex();
-    // lazy kick: if empty or stale > 15min, do a small sync inline (best-effort)
-    const staleMs = 5 * 60 * 1000;
-    const stale = !index.updatedAt || (Date.now() - Number(index.updatedAt) > staleMs);
-    const empty = !index.items || index.items.length === 0;
-    let wantSync = false;
-    try {
-      const u = new URL(req.url || '/', 'http://localhost');
-      const s = u.searchParams.get('sync');
-      wantSync = s === '1' || s === 'true';
-    } catch (e) {}
-    let sync = null;
-    // empty always try; or client asked; or stale
-    if (blobEnabled && (empty || wantSync || stale)) {
-      try {
-        const count = index.items ? index.items.length : 0;
-        // near-complete library: only refresh newest pages (new uploads)
-        const nearFull = count >= 8000;
-        if (empty) {
-          sync = await syncIndex({ mode: 'fill', newestPages: 1, crawlPages: 35, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
-        } else if (nearFull) {
-          sync = await syncIndex({ mode: 'newest', newestPages: 3, crawlPages: 0, pageSize: 50, imgConcurrency: 16, listConcurrency: 4 });
-        } else {
-          sync = await syncIndex({ mode: 'balanced', newestPages: 2, crawlPages: 12, pageSize: 50, imgConcurrency: 18, listConcurrency: 6 });
-        }
-        index = await readIndex();
-      } catch (e) {
-        sync = { ok: false, error: String(e.message || e) };
-      }
-    }
+    const index = blobEnabled ? await readIndex() : emptyIndex();
     res.status(200).json({
       status: 'success',
       data: {
         blobEnabled,
-        auto: true,
+        auto: false,
         count: index.items ? index.items.length : 0,
         crawl: index.crawl || null,
         updatedAt: index.updatedAt || 0,
         index,
-        sync,
+        sync: null,
       },
     });
     return;
@@ -68,10 +40,19 @@ module.exports = async function handler(req, res) {
     }
     try {
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+      const prev = await readIndex();
+      const count = prev.items ? prev.items.length : 0;
+      let mode = body.mode;
+      if (!mode) {
+        if (count < 1) mode = 'fill';
+        else if (count < 8000) mode = 'balanced';
+        else mode = 'newest';
+      }
+      const nearFull = count >= 8000 || mode === 'newest';
       const result = await syncIndex({
-        mode: body.mode || 'newest',
-        newestPages: body.newestPages,
-        crawlPages: body.crawlPages,
+        mode,
+        newestPages: body.newestPages != null ? body.newestPages : (nearFull ? 4 : (mode === 'fill' ? 1 : 2)),
+        crawlPages: body.crawlPages != null ? body.crawlPages : (nearFull || mode === 'newest' ? 0 : (mode === 'fill' ? 30 : 12)),
         pageSize: body.pageSize || 50,
         imgConcurrency: body.imgConcurrency || 18,
         listConcurrency: body.listConcurrency || 6,

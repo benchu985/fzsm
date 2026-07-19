@@ -307,7 +307,7 @@
     return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
   }
 
-  /* ---------- IndexedDB + cloud auto index ---------- */
+  /* ---------- IndexedDB + cloud manual index ---------- */
   function idbOpen() {
     return new Promise(function (resolve, reject) {
       var req = indexedDB.open(IDB_NAME, 1);
@@ -371,7 +371,9 @@
     if (!el) return;
     var crawl = state.crawl || {};
     var prog = '';
-    if (state.indexCount >= 8000) {
+    var mode = crawl.mode || '';
+    var nearFull = state.indexCount >= 8000 || crawl.done || mode === 'newest' || mode === 'local-full';
+    if (nearFull) {
       prog = ' · 仅同步新图';
     } else if (crawl.totalPages) {
       prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages;
@@ -389,11 +391,10 @@
       updateIndexInfo('本地缓存不可用');
     }
   }
-  async function loadCloudIndex(doSync) {
+  async function loadCloudIndex() {
     try {
       updateIndexInfo('拉取云端…');
-      var url = '/api/cover-index' + (doSync ? '?sync=1' : '');
-      var res = await fetch(url, { cache: 'no-store' });
+      var res = await fetch('/api/cover-index', { cache: 'no-store' });
       var data = await res.json();
       state.blobEnabled = !!(data && data.data && data.data.blobEnabled);
       var index = data && data.data && data.data.index;
@@ -404,10 +405,7 @@
         await idbPutMany(items);
         refreshIndexMap(items);
       }
-      var sync = data && data.data && data.data.sync;
-      var extra = state.blobEnabled ? (state.indexCount >= 8000 ? '自动同步新图' : '自动同步') : 'Blob未配置';
-      if (sync && sync.ok) extra = '已刷新 +' + (sync.added || 0);
-      if (sync && sync.ok === false) extra = '同步失败';
+      var extra = state.blobEnabled ? '手动同步' : 'Blob未配置';
       updateIndexInfo(extra);
       return true;
     } catch (e) {
@@ -415,16 +413,37 @@
       return false;
     }
   }
-  // background: periodically refresh cloud index (no manual button)
-  function scheduleIndexRefresh() {
-    // first force sync once if empty
-    loadCloudIndex(state.indexCount < 1).then(function () {
-      // then soft refresh every 3 minutes
-      setInterval(function () {
-        // index nearly full: only soft-refresh newest via GET ?sync=1
-        loadCloudIndex(true);
-      }, 3 * 60 * 1000);
-    });
+  async function manualSyncIndex() {
+    if (state.syncBusy) return;
+    state.syncBusy = true;
+    var btn = $('btnSyncIndex');
+    if (btn) { btn.disabled = true; btn.textContent = '同步中…'; }
+    try {
+      updateIndexInfo('同步中…');
+      setMsg($('status'), '正在同步云端索引（仅抓新图）…');
+      var res = await fetch('/api/cover-index', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: state.indexCount >= 8000 ? 'newest' : (state.indexCount < 1 ? 'fill' : 'balanced') }),
+        cache: 'no-store',
+      });
+      var data = await res.json();
+      if (!res.ok || (data && data.status === 'error')) {
+        throw new Error((data && data.message) || ('HTTP ' + res.status));
+      }
+      var result = data && data.data ? data.data : {};
+      // re-pull full index for IDB
+      await loadCloudIndex();
+      var added = result.added != null ? result.added : 0;
+      updateIndexInfo('已同步 +' + added);
+      setMsg($('status'), '索引同步完成 · +' + added + ' · 共 ' + (result.count != null ? result.count : state.indexCount) + ' 条', 'ok');
+    } catch (e) {
+      updateIndexInfo('同步失败');
+      setMsg($('status'), '同步失败：' + (e.message || e), 'err');
+    } finally {
+      state.syncBusy = false;
+      if (btn) { btn.disabled = false; btn.textContent = '同步索引'; }
+    }
   }
   function cancelWork(msg) {
     state.imgToken = (state.imgToken || 0) + 1;
@@ -532,8 +551,7 @@
       return;
     }
     if (state.indexCount < 1) {
-      setMsg($('status'), '云端索引还在同步中，请稍后再搜（自动获取中）', 'err');
-      loadCloudIndex(true);
+      setMsg($('status'), '本地无索引，请先点「同步索引」', 'err');
       return;
     }
 
@@ -666,7 +684,7 @@
         var prev = $('imgSearchPreview');
         prev.src = state.imgQueryUrl; prev.classList.remove('hidden');
         state.imgQueryFeat = await featuresFromSrc(state.imgQueryUrl);
-        setMsg($('status'), '图片已就绪：可「以图搜图」(走索引) 或先「更新索引」', 'ok');
+        setMsg($('status'), '图片已就绪：建议先「同步索引」，再「以图搜图」', 'ok');
       } catch (err) {
         state.imgQueryFeat = null;
         setMsg($('status'), '图片读取失败：' + (err.message || err), 'err');
@@ -674,6 +692,7 @@
     };
 
     $('btnImgSearch').onclick = function () { runImageSearch(); };
+    if ($('btnSyncIndex')) $('btnSyncIndex').onclick = function () { manualSyncIndex(); };
     $('btnCancelImg').onclick = function () {
       cancelWork('已取消');
       if (state.mode === 'img' && state.imgResults && state.imgResults.length) {
@@ -693,7 +712,7 @@
     watchDom();
     bind();
     await loadLocalIndex();
-    scheduleIndexRefresh();
+    loadCloudIndex();
     loadMarket();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
