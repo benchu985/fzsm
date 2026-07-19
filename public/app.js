@@ -220,6 +220,12 @@
         paintCovers(grid);
       }
       $('pageInfo').textContent = state.page + ' / ' + state.totalPages + ' · 共 ' + state.total;
+      var pageInput = $('pageInput');
+      if (pageInput) {
+        pageInput.max = String(state.totalPages);
+        pageInput.value = String(state.page);
+        pageInput.placeholder = '1-' + state.totalPages;
+      }
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
       scrubTextNodes(grid);
     } catch (e) {
@@ -238,8 +244,26 @@
       loadMarket();
     };
     $('searchInput').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
+    function goPage(raw) {
+      var n = parseInt(raw, 10);
+      if (!isFinite(n)) {
+        setMsg($('status'), '请输入有效页码', 'err');
+        return;
+      }
+      if (n < 1) n = 1;
+      if (state.totalPages > 0 && n > state.totalPages) n = state.totalPages;
+      if (n === state.page) {
+        setMsg($('status'), '已在第 ' + n + ' 页', 'ok');
+        return;
+      }
+      state.page = n;
+      loadMarket();
+      window.scrollTo(0, 0);
+    }
     $('btnPrev').onclick = function () { if (state.page > 1) { state.page--; loadMarket(); window.scrollTo(0, 0); } };
     $('btnNext').onclick = function () { if (state.page < state.totalPages) { state.page++; loadMarket(); window.scrollTo(0, 0); } };
+    $('btnGoPage').onclick = function () { goPage($('pageInput').value); };
+    $('pageInput').onkeydown = function (e) { if (e.key === 'Enter') goPage($('pageInput').value); };
   }
 
   function boot() {

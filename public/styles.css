@@ -73,3 +73,10 @@ body { min-height: 100dvh; }
   grid-column: 1 / -1; text-align: center; color: var(--muted); padding: 40px 12px;
   border: 1px dashed var(--line); border-radius: 12px;
 }
+.page-jump { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+.page-input {
+  width: 72px; padding: 8px 10px; text-align: center;
+  -moz-appearance: textfield;
+}
+.page-input::-webkit-outer-spin-button,
+.page-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
