@@ -11,7 +11,7 @@
   var FEAT_CONCURRENCY = 14;
   var LIST_CONCURRENCY = 4;
   // fast reject: aHash similarity below this => skip (0..1)
-  var HASH_GATE = 0.56; // wider candidate net; final ranking still favors structure
+  var HASH_GATE = 0.70; // structure-only coarse gate; reject color-only lookalikes
 
   var state = {
     page: 1,
