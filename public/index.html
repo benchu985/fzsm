@@ -38,8 +38,10 @@
           <input id="imgSearchFile" type="file" accept="image/*" hidden />
         </label>
         <img id="imgSearchPreview" class="img-preview hidden" alt="query" />
-        <label class="scan-label">扫描页数
-          <input class="field page-input" id="imgScanPages" type="number" min="1" max="50" value="8" inputmode="numeric" />
+        <label class="scan-label" title="指定扫描的列表页范围">页
+          <input class="field page-input" id="imgPageFrom" type="number" min="1" value="1" inputmode="numeric" />
+          <span>-</span>
+          <input class="field page-input" id="imgPageTo" type="number" min="1" value="6" inputmode="numeric" />
         </label>
         <button type="button" class="btn primary" id="btnImgSearch">以图搜图</button>
         <button type="button" class="btn ghost hidden" id="btnClearImgSearch">退出搜图</button>

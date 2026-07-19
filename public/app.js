@@ -20,6 +20,7 @@
     imgQueryUrl: '',
     imgResults: [],
     imgBusy: false,
+    imgToken: 0,
   };
 
   function $(id) { return document.getElementById(id); }
@@ -127,27 +128,58 @@
     return listMarketPage(state.page, state.pageSize);
   }
 
-  /* ---------- image features: aHash(8x8) + color grid(4x4 RGB means) ---------- */
+  /* ---------- image features (fast path) ---------- */
+  var featCache = Object.create(null); // url -> features
+  var FEAT_CONCURRENCY = 14;
+  var LIST_CONCURRENCY = 4;
+
   function loadImageEl(src) {
     return new Promise(function (resolve, reject) {
+      // prefer createImageBitmap resize (much faster decode)
+      if (typeof createImageBitmap === 'function') {
+        fetch(src, { mode: 'cors', credentials: 'omit', cache: 'force-cache' })
+          .then(function (r) {
+            if (!r.ok) throw new Error('fetch ' + r.status);
+            return r.blob();
+          })
+          .then(function (blob) {
+            var opts = { resizeWidth: 32, resizeHeight: 32, resizeQuality: 'low' };
+            return createImageBitmap(blob, opts).catch(function () { return createImageBitmap(blob); });
+          })
+          .then(resolve)
+          .catch(function () {
+            // fallback Image element
+            var img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.decoding = 'async';
+            img.onload = function () { resolve(img); };
+            img.onerror = function () { reject(new Error('image load failed')); };
+            img.src = src;
+          });
+        return;
+      }
       var img = new Image();
       img.crossOrigin = 'anonymous';
+      img.decoding = 'async';
       img.onload = function () { resolve(img); };
       img.onerror = function () { reject(new Error('image load failed')); };
       img.src = src;
     });
   }
+
   function extractFeaturesFromImage(img) {
     var c = document.createElement('canvas');
     c.width = 32;
     c.height = 32;
-    var ctx = c.getContext('2d', { willReadFrequently: true });
+    var ctx = c.getContext('2d', { willReadFrequently: true, alpha: false });
+    // ImageBitmap or HTMLImageElement
     ctx.drawImage(img, 0, 0, 32, 32);
+    if (img.close) { try { img.close(); } catch (e) {} }
     var data = ctx.getImageData(0, 0, 32, 32).data;
 
-    // aHash on 8x8 grayscale averages of 4x4 blocks
-    var gray8 = [];
-    var y, x, by, bx, i, sum, cnt, gy, gx, idx, r, g, b, gray;
+    var gray8 = new Float32Array(64);
+    var i, y, x, by, bx, gy, gx, idx, r, g, b, sum, cnt, avg;
+    // 8x8 block averages from 32x32 (4x4 each)
     for (y = 0; y < 8; y++) {
       for (x = 0; x < 8; x++) {
         sum = 0; cnt = 0;
@@ -157,21 +189,22 @@
             gx = x * 4 + bx;
             idx = (gy * 32 + gx) * 4;
             r = data[idx]; g = data[idx + 1]; b = data[idx + 2];
-            gray = 0.299 * r + 0.587 * g + 0.114 * b;
-            sum += gray; cnt++;
+            sum += 0.299 * r + 0.587 * g + 0.114 * b;
+            cnt++;
           }
         }
-        gray8.push(sum / cnt);
+        gray8[y * 8 + x] = sum / cnt;
       }
     }
-    var avg = 0;
-    for (i = 0; i < gray8.length; i++) avg += gray8[i];
-    avg /= gray8.length;
-    var ahash = [];
-    for (i = 0; i < gray8.length; i++) ahash.push(gray8[i] >= avg ? 1 : 0);
+    avg = 0;
+    for (i = 0; i < 64; i++) avg += gray8[i];
+    avg /= 64;
+    var ahash = new Uint8Array(64);
+    for (i = 0; i < 64; i++) ahash[i] = gray8[i] >= avg ? 1 : 0;
 
-    // 4x4 mean RGB (each cell 8x8 on 32 canvas)
-    var colors = [];
+    // 4x4 mean RGB
+    var colors = new Float32Array(48);
+    var ci = 0;
     for (y = 0; y < 4; y++) {
       for (x = 0; x < 4; x++) {
         var sr = 0, sg = 0, sb = 0; cnt = 0;
@@ -183,36 +216,39 @@
             sr += data[idx]; sg += data[idx + 1]; sb += data[idx + 2]; cnt++;
           }
         }
-        colors.push(sr / cnt, sg / cnt, sb / cnt);
+        colors[ci++] = sr / cnt;
+        colors[ci++] = sg / cnt;
+        colors[ci++] = sb / cnt;
       }
     }
     return { ahash: ahash, colors: colors };
   }
+
   async function featuresFromSrc(src) {
+    if (featCache[src]) return featCache[src];
     var img = await loadImageEl(src);
-    return extractFeaturesFromImage(img);
+    var feat = extractFeaturesFromImage(img);
+    featCache[src] = feat;
+    return feat;
   }
+
   function hamming(a, b) {
     var d = 0;
-    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+    for (var i = 0; i < 64; i++) if (a[i] !== b[i]) d++;
     return d;
   }
   function colorDistance(a, b) {
-    // normalized L1 over 0..255 channels
     var s = 0;
     for (var i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
     return s / (a.length * 255);
   }
   function similarityScore(q, t) {
-    // 0..100, higher better
-    var ham = hamming(q.ahash, t.ahash); // 0..64
-    var hashSim = 1 - ham / 64;
+    var hashSim = 1 - hamming(q.ahash, t.ahash) / 64;
     var colSim = 1 - colorDistance(q.colors, t.colors);
-    var score = 0.62 * hashSim + 0.38 * colSim;
-    return Math.max(0, Math.min(1, score)) * 100;
+    return Math.max(0, Math.min(1, 0.62 * hashSim + 0.38 * colSim)) * 100;
   }
 
-  function mapPool(items, limit, worker) {
+  function mapPool(items, limit, worker, onProgress) {
     return new Promise(function (resolve) {
       var out = new Array(items.length);
       var i = 0, active = 0, done = 0;
@@ -225,6 +261,7 @@
               .catch(function () { out[idx] = null; })
               .then(function () {
                 active--; done++;
+                if (onProgress) onProgress(done, items.length, out[idx]);
                 if (done === items.length) resolve(out);
                 else next();
               });
@@ -234,6 +271,32 @@
       if (!items.length) resolve([]);
       else next();
     });
+  }
+
+  async function fetchListPagesParallel(fromPage, toPage, pageSize) {
+    fromPage = Math.max(1, fromPage | 0);
+    toPage = Math.max(fromPage, toPage | 0);
+    // hard cap range width to avoid accidental huge scans
+    if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
+
+    var probe = await listMarketPage(fromPage, pageSize);
+    if (probe.status !== 'success') return { error: probe.message || '列表失败', items: [], fromPage: fromPage, toPage: toPage, totalPages: 0 };
+    var data = probe.data || {};
+    var totalPages = Number(data.total_pages != null ? data.total_pages : data.totalPages) || 1;
+    if (fromPage > totalPages) {
+      return { error: '起始页超过总页数 ' + totalPages, items: [], fromPage: fromPage, toPage: toPage, totalPages: totalPages };
+    }
+    toPage = Math.min(toPage, totalPages);
+    var pages = [probe];
+    if (fromPage === toPage) return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
+
+    var rest = [];
+    for (var p = fromPage + 1; p <= toPage; p++) rest.push(p);
+    var restResults = await mapPool(rest, LIST_CONCURRENCY, function (p) {
+      return listMarketPage(p, pageSize);
+    });
+    for (var i = 0; i < restResults.length; i++) pages.push(restResults[i]);
+    return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
   }
 
   function cardHtml(item) {
@@ -330,39 +393,58 @@
       setMsg($('status'), '请先选择一张图片', 'err');
       return;
     }
-    var scanPages = parseInt(($('imgScanPages') && $('imgScanPages').value) || '8', 10);
-    if (!isFinite(scanPages) || scanPages < 1) scanPages = 8;
-    if (scanPages > 50) scanPages = 50;
+    var fromPage = parseInt(($('imgPageFrom') && $('imgPageFrom').value) || '1', 10);
+    var toPage = parseInt(($('imgPageTo') && $('imgPageTo').value) || String(fromPage), 10);
+    if (!isFinite(fromPage) || fromPage < 1) fromPage = 1;
+    if (!isFinite(toPage) || toPage < 1) toPage = fromPage;
+    if (toPage < fromPage) { var tmp = fromPage; fromPage = toPage; toPage = tmp; }
+    if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
+    if ($('imgPageFrom')) $('imgPageFrom').value = String(fromPage);
+    if ($('imgPageTo')) $('imgPageTo').value = String(toPage);
 
     state.imgBusy = true;
     state.mode = 'img';
+    state.imgToken = (state.imgToken || 0) + 1;
+    var token = state.imgToken;
     setImgModeUI(true);
     var status = $('status');
     var grid = $('grid');
     grid.innerHTML = '<div class="empty">搜图中…</div>';
 
+    var live = [];
+    var liveMap = Object.create(null);
+    var lastPaint = 0;
+
+    function paintLive(force) {
+      var now = Date.now();
+      if (!force && now - lastPaint < 280) return;
+      lastPaint = now;
+      var arr = live.slice().sort(function (a, b) { return b.score - a.score; });
+      state.imgResults = arr;
+      renderImgResults(arr);
+    }
+
     try {
-      // use current filters
       state.search = $('searchInput').value.trim();
       state.tag = $('tagInput').value.trim();
       state.sort = $('sortSelect').value;
 
-      var pageSize = 24;
-      var all = [];
-      var seen = {};
-      var totalPages = scanPages;
+      var pageSize = 30;
+      setMsg(status, '并行拉取列表 ' + fromPage + '-' + toPage + ' 页…');
+      var listed = await fetchListPagesParallel(fromPage, toPage, pageSize);
+      if (token !== state.imgToken) return;
+      if (listed.error) {
+        setMsg(status, listed.error, 'err');
+        grid.innerHTML = '<div class="empty">列表失败</div>';
+        return;
+      }
 
-      for (var p = 1; p <= scanPages; p++) {
-        setMsg(status, '拉取列表 ' + p + '/' + scanPages + ' …');
-        var r = await listMarketPage(p, pageSize);
-        if (r.status !== 'success') {
-          setMsg(status, r.message || ('第 ' + p + ' 页失败'), 'err');
-          break;
-        }
+      var all = [];
+      var seen = Object.create(null);
+      for (var pi = 0; pi < listed.items.length; pi++) {
+        var r = listed.items[pi];
+        if (!r || r.status !== 'success') continue;
         var data = r.data || {};
-        var tp = Number(data.total_pages != null ? data.total_pages : data.totalPages) || scanPages;
-        if (tp > 0 && tp < totalPages) totalPages = tp;
-        if (p > totalPages) break;
         var raw = Array.isArray(data.items) ? data.items : [];
         for (var i = 0; i < raw.length; i++) {
           var role = sanitizeRole(raw[i]);
@@ -372,36 +454,57 @@
           seen[key] = 1;
           all.push(role);
         }
-        if (p >= totalPages) break;
       }
 
-      setMsg(status, '比对封面 0/' + all.length + ' …');
+      setMsg(status, '比对封面 0/' + all.length + '（并发加速）…');
       var done = 0;
-      var scored = await mapPool(all, 6, async function (item) {
+      var t0 = Date.now();
+      await mapPool(all, FEAT_CONCURRENCY, async function (item) {
+        if (token !== state.imgToken) return null;
         try {
           var feat = await featuresFromSrc(item.image);
           item.score = similarityScore(state.imgQueryFeat, feat);
         } catch (e) {
           item.score = -1;
         }
-        done++;
-        if (done % 4 === 0 || done === all.length) {
-          setMsg(status, '比对封面 ' + done + '/' + all.length + ' …');
+        if (item.score >= 0) {
+          if (!liveMap[item.id] || item.score > liveMap[item.id].score) {
+            if (liveMap[item.id]) {
+              // replace existing
+              for (var k = 0; k < live.length; k++) {
+                if (live[k].id === item.id) { live[k] = item; break; }
+              }
+            } else {
+              live.push(item);
+            }
+            liveMap[item.id] = item;
+          }
         }
         return item;
+      }, function (d, total) {
+        if (token !== state.imgToken) return;
+        done = d;
+        if (d % 6 === 0 || d === total) {
+          var sec = ((Date.now() - t0) / 1000).toFixed(1);
+          setMsg(status, '比对封面 ' + d + '/' + total + ' · ' + sec + 's');
+          paintLive(false);
+        }
       });
 
-      scored = scored.filter(function (x) { return x && x.score >= 0; });
-      scored.sort(function (a, b) { return b.score - a.score; }); // 相关性最高放前面
-      state.imgResults = scored;
-      renderImgResults(scored);
-      var best = scored[0] ? Math.round(scored[0].score) : 0;
-      setMsg(status, '搜图完成：扫描 ' + all.length + ' 张，按相关度排序（最高 ' + best + '%）', 'ok');
+      if (token !== state.imgToken) return;
+      live.sort(function (a, b) { return b.score - a.score; });
+      state.imgResults = live;
+      paintLive(true);
+      var best = live[0] ? Math.round(live[0].score) : 0;
+      var sec = ((Date.now() - t0) / 1000).toFixed(1);
+      setMsg(status, '完成：页 ' + fromPage + '-' + (listed.toPage || toPage) + ' · ' + live.length + '/' + all.length + ' 张 · 最高相关 ' + best + '% · 耗时 ' + sec + 's', 'ok');
     } catch (e) {
-      setMsg(status, String(e.message || e), 'err');
-      grid.innerHTML = '<div class="empty">搜图失败</div>';
+      if (token === state.imgToken) {
+        setMsg(status, String(e.message || e), 'err');
+        grid.innerHTML = '<div class="empty">搜图失败</div>';
+      }
     } finally {
-      state.imgBusy = false;
+      if (token === state.imgToken) state.imgBusy = false;
     }
   }
 
@@ -439,6 +542,11 @@
         pageInput.value = String(state.page);
         pageInput.placeholder = '1-' + state.totalPages;
       }
+      // keep range inputs in valid bounds (do not overwrite user to-page)
+      var pf = $('imgPageFrom');
+      var pt = $('imgPageTo');
+      if (pf) { pf.max = String(state.totalPages); if (!pf.value) pf.value = String(state.page); }
+      if (pt) { pt.max = String(state.totalPages); if (!pt.value) pt.value = String(Math.min(state.totalPages, state.page + 5)); }
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
       scrubTextNodes(grid);
     } catch (e) {

@@ -97,3 +97,4 @@ body { min-height: 100dvh; }
   border-radius: 999px; padding: 2px 8px;
 }
 .card.rank-1 { box-shadow: 0 0 0 1px rgba(255,111,174,.55); }
+.scan-label .page-input { width: 64px; }
