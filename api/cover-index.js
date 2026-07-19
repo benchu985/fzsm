@@ -18,7 +18,7 @@ module.exports = async function handler(req, res) {
     const blobEnabled = hasBlob();
     let index = blobEnabled ? await readIndex() : emptyIndex();
     // lazy kick: if empty or stale > 15min, do a small sync inline (best-effort)
-    const staleMs = 15 * 60 * 1000;
+    const staleMs = 5 * 60 * 1000;
     const stale = !index.updatedAt || (Date.now() - Number(index.updatedAt) > staleMs);
     const empty = !index.items || index.items.length === 0;
     let wantSync = false;
@@ -31,7 +31,7 @@ module.exports = async function handler(req, res) {
     // empty always try; or client asked; or stale
     if (blobEnabled && (empty || wantSync || stale)) {
       try {
-        sync = await syncIndex({ newestPages: empty ? 5 : 2, crawlPages: empty ? 10 : 4 });
+        sync = await syncIndex({ newestPages: empty ? 6 : 3, crawlPages: empty ? 15 : 6, pageSize: 30, imgConcurrency: 10 });
         index = await readIndex();
       } catch (e) {
         sync = { ok: false, error: String(e.message || e) };

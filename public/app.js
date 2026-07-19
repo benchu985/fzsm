@@ -416,7 +416,7 @@
     // first force sync once if empty
     loadCloudIndex(state.indexCount < 1).then(function () {
       // then soft refresh every 3 minutes
-      setInterval(function () { loadCloudIndex(true); }, 3 * 60 * 1000);
+      setInterval(function () { loadCloudIndex(true); }, 2 * 60 * 1000);
     });
   }
   function cancelWork(msg) {
