@@ -1,30 +1,10 @@
-const { list, put, head } = require('@vercel/blob');
-
-const INDEX_PATH = 'fzsm/cover-index.json';
+const { hasBlob, readIndex, emptyIndex, syncIndex } = require('../lib/cover-index-server');
 
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Cache-Control', 'no-store');
-}
-
-function hasBlob() {
-  return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-}
-
-async function readIndex() {
-  if (!hasBlob()) return null;
-  try {
-    const result = await list({ prefix: INDEX_PATH, limit: 10 });
-    const file = (result.blobs || []).find((b) => b.pathname === INDEX_PATH) || (result.blobs || [])[0];
-    if (!file || !file.url) return null;
-    const resp = await fetch(file.url, { cache: 'no-store' });
-    if (!resp.ok) return null;
-    return await resp.json();
-  } catch (e) {
-    return null;
-  }
 }
 
 module.exports = async function handler(req, res) {
@@ -36,60 +16,64 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'GET') {
     const blobEnabled = hasBlob();
-    const index = blobEnabled ? await readIndex() : null;
+    let index = blobEnabled ? await readIndex() : emptyIndex();
+    // lazy kick: if empty or stale > 15min, do a small sync inline (best-effort)
+    const staleMs = 15 * 60 * 1000;
+    const stale = !index.updatedAt || (Date.now() - Number(index.updatedAt) > staleMs);
+    const empty = !index.items || index.items.length === 0;
+    let wantSync = false;
+    try {
+      const u = new URL(req.url || '/', 'http://localhost');
+      const s = u.searchParams.get('sync');
+      wantSync = s === '1' || s === 'true';
+    } catch (e) {}
+    let sync = null;
+    // empty always try; or client asked; or stale
+    if (blobEnabled && (empty || wantSync || stale)) {
+      try {
+        sync = await syncIndex({ newestPages: empty ? 5 : 2, crawlPages: empty ? 10 : 4 });
+        index = await readIndex();
+      } catch (e) {
+        sync = { ok: false, error: String(e.message || e) };
+      }
+    }
     res.status(200).json({
       status: 'success',
       data: {
         blobEnabled,
-        index: index || { v: 1, updatedAt: 0, items: [] },
-        count: index && Array.isArray(index.items) ? index.items.length : 0,
+        auto: true,
+        count: index.items ? index.items.length : 0,
+        crawl: index.crawl || null,
+        updatedAt: index.updatedAt || 0,
+        index,
+        sync,
       },
     });
     return;
   }
 
-  if (req.method === 'PUT') {
+  if (req.method === 'POST') {
     if (!hasBlob()) {
-      res.status(501).json({
-        status: 'error',
-        code: 'blob_not_configured',
-        message: '未配置 BLOB_READ_WRITE_TOKEN，索引仅保存在浏览器本地',
-        data: null,
-      });
+      res.status(501).json({ status: 'error', code: 'blob_not_configured', message: 'Blob 未配置', data: null });
       return;
     }
     try {
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
-      const incoming = body.index || body;
-      if (!incoming || !Array.isArray(incoming.items)) {
-        res.status(400).json({ status: 'error', code: 'bad_index', message: 'index.items 必填', data: null });
-        return;
-      }
-      // merge with existing
-      const prev = (await readIndex()) || { v: 1, items: [] };
-      const map = Object.create(null);
-      (prev.items || []).forEach((it) => { if (it && it.id != null) map[String(it.id)] = it; });
-      (incoming.items || []).forEach((it) => { if (it && it.id != null) map[String(it.id)] = it; });
-      const merged = {
-        v: 1,
-        updatedAt: Date.now(),
-        items: Object.keys(map).map((k) => map[k]),
-      };
-      const blob = await put(INDEX_PATH, JSON.stringify(merged), {
-        access: 'public',
-        contentType: 'application/json; charset=utf-8',
-        addRandomSuffix: false,
-        allowOverwrite: true,
+      const result = await syncIndex({
+        newestPages: body.newestPages,
+        crawlPages: body.crawlPages,
+        pageSize: body.pageSize,
       });
-      res.status(200).json({
-        status: 'success',
-        data: { count: merged.items.length, url: blob.url, updatedAt: merged.updatedAt },
-      });
+      res.status(200).json({ status: 'success', data: result });
     } catch (e) {
-      res.status(500).json({ status: 'error', code: 'put_failed', message: String(e.message || e), data: null });
+      res.status(500).json({ status: 'error', code: 'sync_failed', message: String(e.message || e), data: null });
     }
     return;
   }
 
-  res.status(405).json({ status: 'error', code: 'method_not_allowed', message: 'GET/PUT only', data: null });
+  res.status(405).json({ status: 'error', code: 'method_not_allowed', message: 'GET/POST only', data: null });
+};
+
+module.exports.config = {
+  maxDuration: 60,
 };

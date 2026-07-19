@@ -307,15 +307,13 @@
     return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
   }
 
-  /* ---------- IndexedDB ---------- */
+  /* ---------- IndexedDB + cloud auto index ---------- */
   function idbOpen() {
     return new Promise(function (resolve, reject) {
       var req = indexedDB.open(IDB_NAME, 1);
       req.onupgradeneeded = function () {
         var db = req.result;
-        if (!db.objectStoreNames.contains(IDB_STORE)) {
-          db.createObjectStore(IDB_STORE, { keyPath: 'id' });
-        }
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE, { keyPath: 'id' });
       };
       req.onsuccess = function () { resolve(req.result); };
       req.onerror = function () { reject(req.error || new Error('idb open failed')); };
@@ -344,7 +342,6 @@
     db.close();
     return items;
   }
-
   function itemFromIndexRec(rec) {
     if (!rec || rec.id == null || !rec.ahash) return null;
     return {
@@ -357,18 +354,6 @@
       likes: rec.likes || 0,
     };
   }
-  function recFromRoleFeat(role, feat) {
-    return {
-      id: role.id,
-      name: role.name || '',
-      image: role.image || '',
-      ahash: ahashToB64(feat.ahash),
-      colors: colorsToArr(feat.colors),
-      views: role.views || 0,
-      likes: role.likes || 0,
-      updatedAt: Date.now(),
-    };
-  }
   function refreshIndexMap(recs) {
     state.indexMap = Object.create(null);
     for (var i = 0; i < recs.length; i++) {
@@ -377,81 +362,74 @@
     }
     state.indexCount = Object.keys(state.indexMap).length;
   }
+  function fmtTime(ts) {
+    if (!ts) return '-';
+    try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts); }
+  }
   function updateIndexInfo(extra) {
     var el = $('indexInfo');
     if (!el) return;
-    var cloud = state.blobEnabled ? '云端可写' : '仅本地';
-    el.textContent = '索引：本地 ' + state.indexCount + ' 条 · ' + cloud + (extra ? ' · ' + extra : '');
+    var crawl = state.crawl || {};
+    var prog = '';
+    if (crawl.totalPages) prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages;
+    el.textContent = '云端索引：' + state.indexCount + ' 条' + prog +
+      (state.indexUpdatedAt ? (' · 更新 ' + fmtTime(state.indexUpdatedAt)) : '') +
+      (extra ? (' · ' + extra) : '');
   }
-
   async function loadLocalIndex() {
     try {
       var recs = await idbGetAll();
       refreshIndexMap(recs);
-      updateIndexInfo('已加载');
+      updateIndexInfo('本地缓存');
     } catch (e) {
-      updateIndexInfo('本地索引不可用');
+      updateIndexInfo('本地缓存不可用');
     }
   }
-  async function loadCloudIndex() {
+  async function loadCloudIndex(doSync) {
     try {
-      var res = await fetch('/api/cover-index', { cache: 'no-store' });
+      updateIndexInfo('拉取云端…');
+      var url = '/api/cover-index' + (doSync ? '?sync=1' : '');
+      var res = await fetch(url, { cache: 'no-store' });
       var data = await res.json();
       state.blobEnabled = !!(data && data.data && data.data.blobEnabled);
-      var items = data && data.data && data.data.index && data.data.index.items;
-      if (Array.isArray(items) && items.length) {
+      var index = data && data.data && data.data.index;
+      var items = index && Array.isArray(index.items) ? index.items : [];
+      state.crawl = (data && data.data && data.data.crawl) || (index && index.crawl) || null;
+      state.indexUpdatedAt = (data && data.data && data.data.updatedAt) || (index && index.updatedAt) || 0;
+      if (items.length) {
         await idbPutMany(items);
-        var recs = await idbGetAll();
-        refreshIndexMap(recs);
-        updateIndexInfo('已同步云端 ' + items.length);
-      } else {
-        updateIndexInfo(state.blobEnabled ? '云端空索引' : '未配置云端 Blob');
+        refreshIndexMap(items);
       }
+      var sync = data && data.data && data.data.sync;
+      var extra = state.blobEnabled ? '自动同步' : 'Blob未配置';
+      if (sync && sync.ok) extra = '已刷新 +' + (sync.added || 0);
+      if (sync && sync.ok === false) extra = '同步失败';
+      updateIndexInfo(extra);
+      return true;
     } catch (e) {
-      updateIndexInfo('云端索引读取失败');
+      updateIndexInfo('云端读取失败');
+      return false;
     }
   }
-  async function pushCloudIndex(recs) {
-    if (!state.blobEnabled) return { ok: false, message: '未配置云端' };
-    try {
-      var res = await fetch('/api/cover-index', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ index: { v: 1, items: recs } }),
-      });
-      var data = await res.json();
-      if (!res.ok || data.status !== 'success') {
-        return { ok: false, message: (data && data.message) || ('HTTP ' + res.status) };
-      }
-      return { ok: true, count: data.data && data.data.count };
-    } catch (e) {
-      return { ok: false, message: String(e.message || e) };
-    }
+  // background: periodically refresh cloud index (no manual button)
+  function scheduleIndexRefresh() {
+    // first force sync once if empty
+    loadCloudIndex(state.indexCount < 1).then(function () {
+      // then soft refresh every 3 minutes
+      setInterval(function () { loadCloudIndex(true); }, 3 * 60 * 1000);
+    });
   }
-
   function cancelWork(msg) {
     state.imgToken = (state.imgToken || 0) + 1;
     state.imgBusy = false;
     if (msg) setMsg($('status'), msg, 'ok');
   }
-
   function getMinScore() {
     var n = parseInt(($('imgMinScore') && $('imgMinScore').value) || '60', 10);
     if (!isFinite(n)) n = 60;
     if (n < 30) n = 30;
     if (n > 95) n = 95;
     return n;
-  }
-  function getPageRange() {
-    var fromPage = parseInt(($('imgPageFrom') && $('imgPageFrom').value) || '1', 10);
-    var toPage = parseInt(($('imgPageTo') && $('imgPageTo').value) || String(fromPage), 10);
-    if (!isFinite(fromPage) || fromPage < 1) fromPage = 1;
-    if (!isFinite(toPage) || toPage < 1) toPage = fromPage;
-    if (toPage < fromPage) { var tmp = fromPage; fromPage = toPage; toPage = tmp; }
-    if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
-    if ($('imgPageFrom')) $('imgPageFrom').value = String(fromPage);
-    if ($('imgPageTo')) $('imgPageTo').value = String(toPage);
-    return { fromPage: fromPage, toPage: toPage };
   }
 
   /* ---------- render ---------- */
@@ -539,78 +517,6 @@
     scrubTextNodes(grid);
   }
 
-  /* ---------- build index (scan once, store) ---------- */
-  async function buildIndex() {
-    if (state.imgBusy) return;
-    var range = getPageRange();
-    state.imgBusy = true;
-    state.imgToken += 1;
-    var token = state.imgToken;
-    var status = $('status');
-    try {
-      state.search = $('searchInput').value.trim();
-      state.tag = $('tagInput').value.trim();
-      state.sort = $('sortSelect').value;
-      setMsg(status, '更新索引：拉列表 ' + range.fromPage + '-' + range.toPage + '…');
-      var listed = await fetchListPagesParallel(range.fromPage, range.toPage, 30);
-      if (token !== state.imgToken) return;
-      if (listed.error) { setMsg(status, listed.error, 'err'); return; }
-
-      var roles = [];
-      var seen = Object.create(null);
-      for (var pi = 0; pi < listed.items.length; pi++) {
-        var r = listed.items[pi];
-        if (!r || r.status !== 'success') continue;
-        var raw = Array.isArray(r.data && r.data.items) ? r.data.items : [];
-        for (var i = 0; i < raw.length; i++) {
-          var role = sanitizeRole(raw[i]);
-          if (!role || !role.image) continue;
-          var key = String(role.id);
-          if (seen[key]) continue;
-          seen[key] = 1;
-          // skip if already indexed with same image
-          var old = state.indexMap[key];
-          if (old && old.image === role.image && old.ahash) continue;
-          roles.push(role);
-        }
-      }
-
-      setMsg(status, '更新索引：提取特征 0/' + roles.length + '（已有可跳过）…');
-      var newRecs = [];
-      var t0 = Date.now();
-      await mapPool(roles, FEAT_CONCURRENCY, async function (role) {
-        if (token !== state.imgToken) return null;
-        try {
-          var feat = await featuresFromSrc(role.image);
-          var rec = recFromRoleFeat(role, feat);
-          newRecs.push(rec);
-          // update memory immediately
-          var it = itemFromIndexRec(rec);
-          if (it) state.indexMap[String(it.id)] = it;
-          return rec;
-        } catch (e) { return null; }
-      }, function (d, total) {
-        if (token !== state.imgToken) return;
-        if (d % 5 === 0 || d === total) {
-          setMsg(status, '更新索引：提取特征 ' + d + '/' + total + ' · 新增 ' + newRecs.length);
-        }
-      });
-      if (token !== state.imgToken) return;
-
-      if (newRecs.length) await idbPutMany(newRecs);
-      var allRecs = await idbGetAll();
-      refreshIndexMap(allRecs);
-      var cloud = await pushCloudIndex(allRecs);
-      var sec = ((Date.now() - t0) / 1000).toFixed(1);
-      updateIndexInfo(cloud.ok ? ('已上传云端 ' + (cloud.count || allRecs.length)) : (cloud.message || '仅本地'));
-      setMsg(status, '索引完成：新增 ' + newRecs.length + ' · 总计 ' + state.indexCount + ' · ' + sec + 's' + (cloud.ok ? ' · 已同步 Vercel' : ' · 本地已保存'), 'ok');
-    } catch (e) {
-      if (token === state.imgToken) setMsg(status, String(e.message || e), 'err');
-    } finally {
-      if (token === state.imgToken) state.imgBusy = false;
-    }
-  }
-
   /* ---------- search against index (no re-download) ---------- */
   async function runImageSearch() {
     if (state.imgBusy) return;
@@ -619,7 +525,8 @@
       return;
     }
     if (state.indexCount < 1) {
-      setMsg($('status'), '索引为空：先点「更新索引」扫描页范围', 'err');
+      setMsg($('status'), '云端索引还在同步中，请稍后再搜（自动获取中）', 'err');
+      loadCloudIndex(true);
       return;
     }
 
@@ -710,9 +617,6 @@
         pageInput.value = String(state.page);
         pageInput.placeholder = '1-' + state.totalPages;
       }
-      var pf = $('imgPageFrom'); var pt = $('imgPageTo');
-      if (pf) pf.max = String(state.totalPages);
-      if (pt) pt.max = String(state.totalPages);
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
       scrubTextNodes(grid);
     } catch (e) {
@@ -762,7 +666,6 @@
       }
     };
 
-    $('btnBuildIndex').onclick = function () { buildIndex(); };
     $('btnImgSearch').onclick = function () { runImageSearch(); };
     $('btnCancelImg').onclick = function () {
       cancelWork('已取消');
@@ -783,7 +686,7 @@
     watchDom();
     bind();
     await loadLocalIndex();
-    loadCloudIndex(); // non-blocking-ish
+    scheduleIndexRefresh();
     loadMarket();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

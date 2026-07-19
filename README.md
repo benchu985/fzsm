@@ -25,14 +25,17 @@ vercel.json
 npx vercel --prod
 ```
 
-## 封面索引（以图搜图加速）
+## 云端自动索引
 
-1. 选择页范围后点 **更新索引**：提取封面特征并保存
-2. 默认保存在浏览器 **IndexedDB**（下次打开仍可用，搜图不再重新下图）
-3. 若 Vercel 配置了 `BLOB_READ_WRITE_TOKEN`，索引会同步到 **Vercel Blob** 云端共享
-4. **以图搜图** 只在索引里做高相似比对：低相似 aHash 直接丢弃
+- Vercel Cron 每 10 分钟：`/api/cron-sync-index`
+  - 刷新最新页（新图）
+  - 继续全库爬取并写入 Blob 索引
+- 前端打开自动拉 `/api/cover-index`
+  - 空索引/过期时服务端自动补同步
+  - **无需手动更新索引**
+- 以图搜图只比对云端索引，低相似直接丢弃
 
-```bash
-# 可选：在 Vercel 项目启用 Blob 并写入环境变量
-vercel env add BLOB_READ_WRITE_TOKEN
-```
+环境变量：
+- `BLOB_READ_WRITE_TOKEN`（已配置）
+- 可选 `CRON_SECRET`
+

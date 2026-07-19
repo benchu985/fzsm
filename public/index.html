@@ -38,20 +38,14 @@
           <input id="imgSearchFile" type="file" accept="image/*" hidden />
         </label>
         <img id="imgSearchPreview" class="img-preview hidden" alt="query" />
-        <label class="scan-label" title="构建索引时扫描的列表页范围">页
-          <input class="field page-input" id="imgPageFrom" type="number" min="1" value="1" inputmode="numeric" />
-          <span>-</span>
-          <input class="field page-input" id="imgPageTo" type="number" min="1" value="6" inputmode="numeric" />
-        </label>
         <label class="scan-label" title="只保留高相似结果">阈值%
           <input class="field page-input" id="imgMinScore" type="number" min="30" max="95" value="60" inputmode="numeric" />
         </label>
-        <button type="button" class="btn ghost" id="btnBuildIndex">更新索引</button>
         <button type="button" class="btn primary" id="btnImgSearch">以图搜图</button>
         <button type="button" class="btn ghost" id="btnCancelImg">取消</button>
         <button type="button" class="btn ghost hidden" id="btnClearImgSearch">退出搜图</button>
       </div>
-      <div id="indexInfo" class="index-info">索引：加载中…</div>
+      <div id="indexInfo" class="index-info">云端索引：加载中…</div>
 
       <div id="status" class="status"></div>
       <div class="grid" id="grid"></div>
