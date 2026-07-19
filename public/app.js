@@ -155,6 +155,12 @@
     return ahash;
   }
   function b64ToDhash(b) { return b ? b64ToAhash(b) : null; }
+  function b64ToLuma(b) {
+    if (!b) return null;
+    var bin = atob(b); var out = new Uint8Array(64);
+    for (var i = 0; i < 64; i++) out[i] = bin.charCodeAt(i) || 0;
+    return out;
+  }
   function colorsToArr(colors) {
     var out = new Array(colors.length);
     for (var i = 0; i < colors.length; i++) out[i] = Math.round(colors[i]);
@@ -219,6 +225,8 @@
       }
     }
     avg = 0; for (i = 0; i < 64; i++) avg += gray8[i]; avg /= 64;
+    var luma = new Uint8Array(64);
+    for (i = 0; i < 64; i++) luma[i] = Math.max(0, Math.min(255, Math.round(gray8[i])));
     var ahash = new Uint8Array(64);
     for (i = 0; i < 64; i++) ahash[i] = gray8[i] >= avg ? 1 : 0;
     // dHash preserves local edge/layout information and rejects same-color lookalikes.
@@ -246,7 +254,7 @@
         colors[ci++] = sr / cnt; colors[ci++] = sg / cnt; colors[ci++] = sb / cnt;
       }
     }
-    return { ahash: ahash, dhash: dhash, colors: colors };
+    return { ahash: ahash, dhash: dhash, luma: luma, colors: colors };
   }
 
   async function featuresFromSrc(src) {
@@ -274,10 +282,19 @@
     var dSim = 1 - hamming(q.dhash, t.dhash) / 64;
     return 0.45 * aSim + 0.55 * dSim;
   }
+  function lumaSimilarity(q, t) {
+    if (!q.luma || !t.luma) return null;
+    var sum = 0;
+    for (var i = 0; i < 64; i++) sum += Math.abs(q.luma[i] - t.luma[i]);
+    return 1 - sum / (64 * 255);
+  }
   function similarityScore(q, t) {
     var structureSim = hashSimilarity(q, t);
     var colSim = 1 - colorDistance(q.colors, t.colors);
-    // Structure/layout dominates; palette only breaks ties.
+    var lumaSim = lumaSimilarity(q, t);
+    // The luminance profile tracks what the eye sees after resize/compression.
+    // Structural hashes still prevent same-colour but unrelated covers ranking high.
+    if (lumaSim != null) return Math.max(0, Math.min(1, 0.75 * lumaSim + 0.20 * structureSim + 0.05 * colSim)) * 100;
     return Math.max(0, Math.min(1, 0.94 * structureSim + 0.06 * colSim)) * 100;
   }
 
@@ -368,6 +385,7 @@
       image: rec.image || '',
       ahash: typeof rec.ahash === 'string' ? b64ToAhash(rec.ahash) : rec.ahash,
       dhash: typeof rec.dhash === 'string' ? b64ToDhash(rec.dhash) : (rec.dhash || null),
+      luma: typeof rec.luma === 'string' ? b64ToLuma(rec.luma) : (rec.luma || null),
       colors: rec.colors || [],
       views: rec.views || 0,
       likes: rec.likes || 0,

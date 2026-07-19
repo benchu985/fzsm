@@ -125,6 +125,7 @@ def image_features(img_bytes: bytes) -> tuple[str, str, list[int]]:
         if bit:
             out[i >> 3] |= 1 << (7 - (i & 7))
     ahash = base64.b64encode(bytes(out)).decode("ascii")
+    luma = base64.b64encode(bytes(max(0, min(255, round(v))) for v in gray8)).decode("ascii")
 
     # 9x8 horizontal difference hash: captures edges and layout rather than palette.
     dbits: list[int] = []
@@ -159,7 +160,7 @@ def image_features(img_bytes: bytes) -> tuple[str, str, list[int]]:
                     sb += b
                     n += 1
             colors.extend([round(sr / n), round(sg / n), round(sb / n)])
-    return ahash, dhash, colors
+    return ahash, dhash, luma, colors
 
 
 def fetch_existing_index(token: str) -> dict:
@@ -300,13 +301,14 @@ def process_role(role: dict) -> dict | None:
     for attempt in range(3):
         try:
             img_bytes = http_bytes(img_url, timeout=45)
-            ahash, dhash, colors = image_features(img_bytes)
+            ahash, dhash, luma, colors = image_features(img_bytes)
             return {
                 "id": role["id"],
                 "name": role.get("name") or "",
                 "image": img_url,
                 "ahash": ahash,
                 "dhash": dhash,
+                "luma": luma,
                 "colors": colors,
                 "views": role.get("views") or 0,
                 "likes": role.get("likes") or 0,
@@ -332,7 +334,7 @@ def main():
     need = []
     for role in roles:
         old = items_map.get(str(role["id"]))
-        if old and old.get("image") == role["image"] and old.get("ahash") and old.get("dhash"):
+        if old and old.get("image") == role["image"] and old.get("ahash") and old.get("dhash") and old.get("luma"):
             continue
         need.append(role)
     print(f"need features: {len(need)} (already have {len(items_map)})")
