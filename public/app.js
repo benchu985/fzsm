@@ -11,7 +11,7 @@
   var FEAT_CONCURRENCY = 14;
   var LIST_CONCURRENCY = 4;
   // fast reject: aHash similarity below this => skip (0..1)
-  var HASH_GATE = 0.62; // ~ hamming <= 24/64
+  var HASH_GATE = 0.70; // structure-only coarse gate; reject color-only lookalikes
 
   var state = {
     page: 1,
@@ -29,7 +29,7 @@
     imgToken: 0,
     indexCount: 0,
     blobEnabled: false,
-    indexMap: Object.create(null), // id -> {id,name,image,ahash,colors}
+    indexMap: Object.create(null), // id -> {id,name,image,ahash,dhash,colors}
   };
 
   function $(id) { return document.getElementById(id); }
@@ -154,6 +154,7 @@
     }
     return ahash;
   }
+  function b64ToDhash(b) { return b ? b64ToAhash(b) : null; }
   function colorsToArr(colors) {
     var out = new Array(colors.length);
     for (var i = 0; i < colors.length; i++) out[i] = Math.round(colors[i]);
@@ -220,6 +221,18 @@
     avg = 0; for (i = 0; i < 64; i++) avg += gray8[i]; avg /= 64;
     var ahash = new Uint8Array(64);
     for (i = 0; i < 64; i++) ahash[i] = gray8[i] >= avg ? 1 : 0;
+    // dHash preserves local edge/layout information and rejects same-color lookalikes.
+    var dhash = new Uint8Array(64); var di = 0;
+    for (y = 0; y < 8; y++) {
+      for (x = 0; x < 8; x++) {
+        var lx = Math.floor(x * 32 / 9), rx = Math.floor((x + 1) * 32 / 9);
+        var py = Math.floor(y * 32 / 8);
+        var li = (py * 32 + lx) * 4, ri = (py * 32 + rx) * 4;
+        var lv = 0.299 * data[li] + 0.587 * data[li + 1] + 0.114 * data[li + 2];
+        var rv = 0.299 * data[ri] + 0.587 * data[ri + 1] + 0.114 * data[ri + 2];
+        dhash[di++] = lv >= rv ? 1 : 0;
+      }
+    }
     var colors = new Float32Array(48); var ci = 0;
     for (y = 0; y < 4; y++) {
       for (x = 0; x < 4; x++) {
@@ -233,7 +246,7 @@
         colors[ci++] = sr / cnt; colors[ci++] = sg / cnt; colors[ci++] = sb / cnt;
       }
     }
-    return { ahash: ahash, colors: colors };
+    return { ahash: ahash, dhash: dhash, colors: colors };
   }
 
   async function featuresFromSrc(src) {
@@ -255,12 +268,17 @@
     return s / (n * 255);
   }
   function hashSimilarity(q, t) {
-    return 1 - hamming(q.ahash, t.ahash) / 64;
+    var aSim = 1 - hamming(q.ahash, t.ahash) / 64;
+    // Legacy records are accepted temporarily; rebuilt records use both hashes.
+    if (!q.dhash || !t.dhash) return aSim;
+    var dSim = 1 - hamming(q.dhash, t.dhash) / 64;
+    return 0.45 * aSim + 0.55 * dSim;
   }
   function similarityScore(q, t) {
-    var hashSim = hashSimilarity(q, t);
+    var structureSim = hashSimilarity(q, t);
     var colSim = 1 - colorDistance(q.colors, t.colors);
-    return Math.max(0, Math.min(1, 0.62 * hashSim + 0.38 * colSim)) * 100;
+    // Structure/layout dominates; palette only breaks ties.
+    return Math.max(0, Math.min(1, 0.94 * structureSim + 0.06 * colSim)) * 100;
   }
 
   function mapPool(items, limit, worker, onProgress) {
@@ -349,6 +367,7 @@
       name: brandText(rec.name || ''),
       image: rec.image || '',
       ahash: typeof rec.ahash === 'string' ? b64ToAhash(rec.ahash) : rec.ahash,
+      dhash: typeof rec.dhash === 'string' ? b64ToDhash(rec.dhash) : (rec.dhash || null),
       colors: rec.colors || [],
       views: rec.views || 0,
       likes: rec.likes || 0,
