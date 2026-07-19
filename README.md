@@ -27,12 +27,11 @@ npx vercel --prod
 
 ## 云端自动索引
 
-- Vercel Cron 每 10 分钟：`/api/cron-sync-index`
-  - 刷新最新页（新图）
-  - 继续全库爬取并写入 Blob 索引
-- 前端打开自动拉 `/api/cover-index`
-  - 空索引/过期时服务端自动补同步
-  - **无需手动更新索引**
+- Vercel Cron **每 10 分钟**：`/api/cron-sync-index`
+  - `schedule: "*/10 * * * *"`
+  - 刷新最新 5 页封面（约 250 条范围）并写入 Blob 索引
+- 前端打开自动拉 `/api/cover-index`（只读，不触发同步）
+- 也可点「同步索引」手动立即刷新
 - 以图搜图只比对云端索引，低相似直接丢弃
 
 环境变量：

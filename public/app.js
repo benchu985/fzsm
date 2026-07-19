@@ -411,9 +411,11 @@
     var mode = crawl.mode || '';
     var nearFull = state.indexCount >= 8000 || crawl.done || mode === 'newest' || mode === 'local-full';
     if (nearFull) {
-      prog = ' · 仅同步新图';
+      prog = ' · 仅同步新图 · 每10分钟自动';
     } else if (crawl.totalPages) {
-      prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages;
+      prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages + ' · 每10分钟自动';
+    } else {
+      prog = ' · 每10分钟自动';
     }
     el.textContent = '云端索引：' + state.indexCount + ' 条' + prog +
       (state.indexUpdatedAt ? (' · 更新 ' + fmtTime(state.indexUpdatedAt)) : '') +

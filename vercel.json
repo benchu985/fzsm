@@ -5,7 +5,7 @@
   "crons": [
     {
       "path": "/api/cron-sync-index",
-      "schedule": "0 4 * * *"
+      "schedule": "*/10 * * * *"
     }
   ],
   "headers": [
