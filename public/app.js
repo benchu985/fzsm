@@ -872,8 +872,8 @@
     };
     $('btnClearImgSearch').onclick = function () {
       cancelWork('已退出搜图');
+      clearUploadedImages();
       state.mode = 'browse';
-      state.imgResults = [];
       setImgModeUI(false);
       loadMarket();
     };
