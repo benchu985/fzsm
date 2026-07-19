@@ -23,6 +23,7 @@
     total: 0,
     mode: 'browse', // browse | img
     imgQueryFeat: null,
+    imgQueryFeats: [],
     imgQueryUrl: '',
     imgResults: [],
     imgBusy: false,
@@ -181,8 +182,7 @@
             return r.blob();
           })
           .then(function (blob) {
-            var opts = { resizeWidth: 32, resizeHeight: 32, resizeQuality: 'low' };
-            return createImageBitmap(blob, opts).catch(function () { return createImageBitmap(blob); });
+            return createImageBitmap(blob);
           })
           .then(resolve)
           .catch(function () {
@@ -204,12 +204,12 @@
     });
   }
 
-  function extractFeaturesFromImage(img) {
+  function extractFeaturesFromImage(img, rect) {
     var c = document.createElement('canvas');
     c.width = 32; c.height = 32;
     var ctx = c.getContext('2d', { willReadFrequently: true, alpha: false });
-    ctx.drawImage(img, 0, 0, 32, 32);
-    if (img.close) { try { img.close(); } catch (e) {} }
+    if (rect) ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h, 0, 0, 32, 32);
+    else ctx.drawImage(img, 0, 0, 32, 32);
     var data = ctx.getImageData(0, 0, 32, 32).data;
     var gray8 = new Float32Array(64);
     var i, y, x, by, bx, gy, gx, idx, r, g, b, sum, cnt, avg;
@@ -259,12 +259,58 @@
     return { ahash: ahash, dhash: dhash, luma: luma, colors: colors };
   }
 
-  async function featuresFromSrc(src) {
+  function candidateCoverRects(width, height) {
+    var aspect = 3 / 4;
+    var maxW = Math.min(width * 0.96, height * aspect * 0.96);
+    var rawWidths = [width * 0.48, width * 0.32, maxW, width * 0.24];
+    var widths = [];
+    for (var i = 0; i < rawWidths.length; i++) {
+      var cw = Math.max(48, Math.min(maxW, rawWidths[i]));
+      var duplicate = false;
+      for (var j = 0; j < widths.length; j++) {
+        if (Math.abs(widths[j] - cw) < Math.max(8, cw * 0.05)) duplicate = true;
+      }
+      if (!duplicate) widths.push(cw);
+    }
+
+    var rects = [];
+    var seen = Object.create(null);
+    var xf = [0, 0.5, 1];
+    var yf = [0, 0.25, 0.5, 0.75, 1];
+    function addRect(x, y, w, h) {
+      x = Math.max(0, Math.min(width - w, x));
+      y = Math.max(0, Math.min(height - h, y));
+      var key = [Math.round(x / 4), Math.round(y / 4), Math.round(w / 4), Math.round(h / 4)].join(':');
+      if (seen[key] || rects.length >= 36) return;
+      seen[key] = 1;
+      rects.push({ x: x, y: y, w: w, h: h });
+    }
+    for (var wi = 0; wi < widths.length && rects.length < 36; wi++) {
+      var w = widths[wi], h = w / aspect;
+      if (w > width || h > height) continue;
+      var maxX = width - w, maxY = height - h;
+      for (var yi = 0; yi < yf.length && rects.length < 36; yi++) {
+        for (var xi = 0; xi < xf.length && rects.length < 36; xi++) {
+          addRect(maxX * xf[xi], maxY * yf[yi], w, h);
+        }
+      }
+    }
+    return rects;
+  }
+
+  async function featureBundleFromSrc(src) {
     if (featCache[src]) return featCache[src];
     var img = await loadImageEl(src);
-    var feat = extractFeaturesFromImage(img);
-    featCache[src] = feat;
-    return feat;
+    var width = Number(img.width || img.naturalWidth) || 32;
+    var height = Number(img.height || img.naturalHeight) || 32;
+    var full = extractFeaturesFromImage(img);
+    var rects = candidateCoverRects(width, height);
+    var crops = [];
+    for (var i = 0; i < rects.length; i++) crops.push(extractFeaturesFromImage(img, rects[i]));
+    if (img.close) { try { img.close(); } catch (e) {} }
+    var bundle = { full: full, crops: crops };
+    featCache[src] = bundle;
+    return bundle;
   }
 
   function hamming(a, b) {
@@ -637,6 +683,51 @@
   }
 
   /* ---------- search against index (no re-download) ---------- */
+  async function searchFeatureSet(queries, gate, minScore, token, status, label) {
+    var ids = Object.keys(state.indexMap);
+    var found = [];
+    var passedHash = 0;
+    for (var i = 0; i < ids.length; i++) {
+      if (token !== state.imgToken) return null;
+      var it = state.indexMap[ids[i]];
+      var bestScore = -1;
+      for (var qi = 0; qi < queries.length; qi++) {
+        var q = queries[qi];
+        var hs = hashSimilarity(q, it);
+        if (hs < gate) continue;
+        var score = similarityScore(q, it);
+        if (score > bestScore) bestScore = score;
+      }
+      if (bestScore >= 0) passedHash++;
+      if (bestScore >= minScore) {
+        found.push({
+          id: it.id,
+          name: it.name,
+          image: it.image,
+          views: it.views || 0,
+          likes: it.likes || 0,
+          score: bestScore,
+        });
+      }
+      if ((i + 1) % 120 === 0) {
+        setMsg(status, label + ' ' + (i + 1) + '/' + ids.length + ' · 命中 ' + found.length);
+        await new Promise(function (r) { setTimeout(r, 0); });
+      }
+    }
+    found.sort(function (a, b) { return b.score - a.score; });
+    return { list: found, checked: ids.length, passedHash: passedHash };
+  }
+
+  function mergeSearchResults(a, b) {
+    var map = Object.create(null);
+    var all = (a || []).concat(b || []);
+    for (var i = 0; i < all.length; i++) {
+      var item = all[i], key = String(item.id);
+      if (!map[key] || item.score > map[key].score) map[key] = item;
+    }
+    return Object.keys(map).map(function (key) { return map[key]; }).sort(function (x, y) { return y.score - x.score; });
+  }
+
   async function runImageSearch() {
     if (state.imgBusy) return;
     if (!state.imgQueryFeat) {
@@ -659,42 +750,29 @@
 
     try {
       var minScore = getMinScore();
-      var q = state.imgQueryFeat;
-      var ids = Object.keys(state.indexMap);
-      var live = [];
       var t0 = Date.now();
-      var checked = 0, passedHash = 0;
+      var fullPass = await searchFeatureSet([state.imgQueryFeat], HASH_GATE, minScore, token, status, '整图比对');
+      if (!fullPass || token !== state.imgToken) return;
+      var live = fullPass.list;
+      var best = live[0] ? live[0].score : 0;
+      var usedRegions = 1;
+      var passedHash = fullPass.passedHash;
+      var fuzzy = !!($('imgFuzzySearch') && $('imgFuzzySearch').checked);
 
-      // pure CPU compare, chunked to keep UI responsive
-      for (var i = 0; i < ids.length; i++) {
-        if (token !== state.imgToken) return;
-        var it = state.indexMap[ids[i]];
-        checked++;
-        var hs = hashSimilarity(q, it);
-        if (hs < HASH_GATE) continue; // 低相似直接丢弃，不算颜色
-        passedHash++;
-        var score = similarityScore(q, it);
-        if (score < minScore) continue; // 只保留高相似
-        live.push({
-          id: it.id,
-          name: it.name,
-          image: it.image,
-          views: it.views || 0,
-          likes: it.likes || 0,
-          score: score,
-        });
-        if (checked % 200 === 0) {
-          setMsg(status, '索引比对 ' + checked + '/' + ids.length + ' · 高相似 ' + live.length);
-          await new Promise(function (r) { setTimeout(r, 0); });
-        }
+      if (fuzzy && state.imgQueryFeats && state.imgQueryFeats.length) {
+        grid.innerHTML = '<div class="empty">正在搜索截图局部…</div>';
+        var cropPass = await searchFeatureSet(state.imgQueryFeats, 0.62, minScore, token, status, '局部比对');
+        if (!cropPass || token !== state.imgToken) return;
+        live = mergeSearchResults(live, cropPass.list);
+        usedRegions += state.imgQueryFeats.length;
+        passedHash += cropPass.passedHash;
+        best = live[0] ? live[0].score : 0;
       }
-      if (token !== state.imgToken) return;
-      live.sort(function (a, b) { return b.score - a.score; });
+
       state.imgResults = live;
       renderImgResults(live);
-      var best = live[0] ? Math.round(live[0].score) : 0;
       var sec = ((Date.now() - t0) / 1000).toFixed(2);
-      setMsg(status, '完成：索引 ' + checked + ' · 粗筛通过 ' + passedHash + ' · 高相似 ' + live.length + ' · 最高 ' + best + '% · ' + sec + 's', 'ok');
+      setMsg(status, '完成：索引 ' + fullPass.checked + ' · 区域 ' + usedRegions + ' · 粗筛 ' + passedHash + ' · 结果 ' + live.length + ' · 最高 ' + Math.round(best) + '% · ' + sec + 's', 'ok');
     } catch (e) {
       if (token === state.imgToken) {
         setMsg(status, String(e.message || e), 'err');
@@ -776,10 +854,13 @@
         state.imgQueryUrl = URL.createObjectURL(file);
         var prev = $('imgSearchPreview');
         prev.src = state.imgQueryUrl; prev.classList.remove('hidden');
-        state.imgQueryFeat = await featuresFromSrc(state.imgQueryUrl);
-        setMsg($('status'), '图片已就绪，可以开始搜图', 'ok');
+        var bundle = await featureBundleFromSrc(state.imgQueryUrl);
+        state.imgQueryFeat = bundle.full;
+        state.imgQueryFeats = bundle.crops || [];
+        setMsg($('status'), '图片已就绪；截图或裁剪图可勾选「模糊」', 'ok');
       } catch (err) {
         state.imgQueryFeat = null;
+        state.imgQueryFeats = [];
         setMsg($('status'), '图片读取失败：' + (err.message || err), 'err');
       }
     };
