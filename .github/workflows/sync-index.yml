@@ -1,0 +1,34 @@
+name: sync-cover-index
+
+on:
+  schedule:
+    # every 10 minutes (UTC); free runners may drift a few minutes
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger newest cover index sync
+        env:
+          SYNC_URL: https://fzsm.vercel.app/api/cron-sync-index
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          headers=(-H "Accept: application/json")
+          if [ -n "${CRON_SECRET:-}" ]; then
+            headers+=(-H "Authorization: Bearer ${CRON_SECRET}")
+          fi
+          code=$(curl -sS -o /tmp/sync-body.json -w "%{http_code}" \
+            --max-time 90 \
+            "${headers[@]}" \
+            "$SYNC_URL")
+          echo "HTTP $code"
+          head -c 2000 /tmp/sync-body.json || true
+          echo
+          case "$code" in
+            200|201|202|204) exit 0 ;;
+            *) exit 1 ;;
+          esac
