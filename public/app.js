@@ -1,4 +1,4 @@
-/* Sm cover-only viewer; text scrub on display only; image similarity search */
+/* Sm cover-only viewer + cover feature index (local IDB / optional Vercel Blob) */
 (function () {
   'use strict';
 
@@ -6,6 +6,12 @@
   var PKG = atob('aW8ucGl1cGl1LmNoYXQ=');
   var SIG = '0290F67FD446FD51D54B8188880523EAFD74CB469CC58A880EE24333ED7AF004';
   var DEVICE_KEY = 'sm_web_device_id';
+  var IDB_NAME = 'fzsm_cover_index';
+  var IDB_STORE = 'items';
+  var FEAT_CONCURRENCY = 14;
+  var LIST_CONCURRENCY = 4;
+  // fast reject: aHash similarity below this => skip (0..1)
+  var HASH_GATE = 0.62; // ~ hamming <= 24/64
 
   var state = {
     page: 1,
@@ -21,6 +27,9 @@
     imgResults: [],
     imgBusy: false,
     imgToken: 0,
+    indexCount: 0,
+    blobEnabled: false,
+    indexMap: Object.create(null), // id -> {id,name,image,ahash,colors}
   };
 
   function $(id) { return document.getElementById(id); }
@@ -124,18 +133,38 @@
       device_id: getDeviceId(),
     });
   }
-  async function listMarket() {
-    return listMarketPage(state.page, state.pageSize);
+  async function listMarket() { return listMarketPage(state.page, state.pageSize); }
+
+  /* ---------- feature codec ---------- */
+  function ahashToB64(ahash) {
+    var bytes = new Uint8Array(8);
+    for (var i = 0; i < 64; i++) {
+      if (ahash[i]) bytes[i >> 3] |= (1 << (7 - (i & 7)));
+    }
+    var s = '';
+    for (var j = 0; j < bytes.length; j++) s += String.fromCharCode(bytes[j]);
+    return btoa(s);
+  }
+  function b64ToAhash(b) {
+    var bin = atob(b || '');
+    var ahash = new Uint8Array(64);
+    for (var i = 0; i < 64; i++) {
+      var byte = bin.charCodeAt(i >> 3) || 0;
+      ahash[i] = (byte >> (7 - (i & 7))) & 1;
+    }
+    return ahash;
+  }
+  function colorsToArr(colors) {
+    var out = new Array(colors.length);
+    for (var i = 0; i < colors.length; i++) out[i] = Math.round(colors[i]);
+    return out;
   }
 
-  /* ---------- image features (fast path) ---------- */
-  var featCache = Object.create(null); // url -> features
-  var FEAT_CONCURRENCY = 14;
-  var LIST_CONCURRENCY = 4;
+  /* ---------- image features ---------- */
+  var featCache = Object.create(null);
 
   function loadImageEl(src) {
     return new Promise(function (resolve, reject) {
-      // prefer createImageBitmap resize (much faster decode)
       if (typeof createImageBitmap === 'function') {
         fetch(src, { mode: 'cors', credentials: 'omit', cache: 'force-cache' })
           .then(function (r) {
@@ -148,7 +177,6 @@
           })
           .then(resolve)
           .catch(function () {
-            // fallback Image element
             var img = new Image();
             img.crossOrigin = 'anonymous';
             img.decoding = 'async';
@@ -169,56 +197,40 @@
 
   function extractFeaturesFromImage(img) {
     var c = document.createElement('canvas');
-    c.width = 32;
-    c.height = 32;
+    c.width = 32; c.height = 32;
     var ctx = c.getContext('2d', { willReadFrequently: true, alpha: false });
-    // ImageBitmap or HTMLImageElement
     ctx.drawImage(img, 0, 0, 32, 32);
     if (img.close) { try { img.close(); } catch (e) {} }
     var data = ctx.getImageData(0, 0, 32, 32).data;
-
     var gray8 = new Float32Array(64);
     var i, y, x, by, bx, gy, gx, idx, r, g, b, sum, cnt, avg;
-    // 8x8 block averages from 32x32 (4x4 each)
     for (y = 0; y < 8; y++) {
       for (x = 0; x < 8; x++) {
         sum = 0; cnt = 0;
         for (by = 0; by < 4; by++) {
           for (bx = 0; bx < 4; bx++) {
-            gy = y * 4 + by;
-            gx = x * 4 + bx;
-            idx = (gy * 32 + gx) * 4;
+            gy = y * 4 + by; gx = x * 4 + bx; idx = (gy * 32 + gx) * 4;
             r = data[idx]; g = data[idx + 1]; b = data[idx + 2];
-            sum += 0.299 * r + 0.587 * g + 0.114 * b;
-            cnt++;
+            sum += 0.299 * r + 0.587 * g + 0.114 * b; cnt++;
           }
         }
         gray8[y * 8 + x] = sum / cnt;
       }
     }
-    avg = 0;
-    for (i = 0; i < 64; i++) avg += gray8[i];
-    avg /= 64;
+    avg = 0; for (i = 0; i < 64; i++) avg += gray8[i]; avg /= 64;
     var ahash = new Uint8Array(64);
     for (i = 0; i < 64; i++) ahash[i] = gray8[i] >= avg ? 1 : 0;
-
-    // 4x4 mean RGB
-    var colors = new Float32Array(48);
-    var ci = 0;
+    var colors = new Float32Array(48); var ci = 0;
     for (y = 0; y < 4; y++) {
       for (x = 0; x < 4; x++) {
         var sr = 0, sg = 0, sb = 0; cnt = 0;
         for (by = 0; by < 8; by++) {
           for (bx = 0; bx < 8; bx++) {
-            gy = y * 8 + by;
-            gx = x * 8 + bx;
-            idx = (gy * 32 + gx) * 4;
+            gy = y * 8 + by; gx = x * 8 + bx; idx = (gy * 32 + gx) * 4;
             sr += data[idx]; sg += data[idx + 1]; sb += data[idx + 2]; cnt++;
           }
         }
-        colors[ci++] = sr / cnt;
-        colors[ci++] = sg / cnt;
-        colors[ci++] = sb / cnt;
+        colors[ci++] = sr / cnt; colors[ci++] = sg / cnt; colors[ci++] = sb / cnt;
       }
     }
     return { ahash: ahash, colors: colors };
@@ -233,17 +245,20 @@
   }
 
   function hamming(a, b) {
-    var d = 0;
-    for (var i = 0; i < 64; i++) if (a[i] !== b[i]) d++;
-    return d;
+    var dlt = 0;
+    for (var i = 0; i < 64; i++) if (a[i] !== b[i]) dlt++;
+    return dlt;
   }
   function colorDistance(a, b) {
-    var s = 0;
-    for (var i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
-    return s / (a.length * 255);
+    var s = 0, n = Math.min(a.length, b.length);
+    for (var i = 0; i < n; i++) s += Math.abs(a[i] - b[i]);
+    return s / (n * 255);
+  }
+  function hashSimilarity(q, t) {
+    return 1 - hamming(q.ahash, t.ahash) / 64;
   }
   function similarityScore(q, t) {
-    var hashSim = 1 - hamming(q.ahash, t.ahash) / 64;
+    var hashSim = hashSimilarity(q, t);
     var colSim = 1 - colorDistance(q.colors, t.colors);
     return Math.max(0, Math.min(1, 0.62 * hashSim + 0.38 * colSim)) * 100;
   }
@@ -276,29 +291,170 @@
   async function fetchListPagesParallel(fromPage, toPage, pageSize) {
     fromPage = Math.max(1, fromPage | 0);
     toPage = Math.max(fromPage, toPage | 0);
-    // hard cap range width to avoid accidental huge scans
     if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
-
     var probe = await listMarketPage(fromPage, pageSize);
     if (probe.status !== 'success') return { error: probe.message || '列表失败', items: [], fromPage: fromPage, toPage: toPage, totalPages: 0 };
     var data = probe.data || {};
     var totalPages = Number(data.total_pages != null ? data.total_pages : data.totalPages) || 1;
-    if (fromPage > totalPages) {
-      return { error: '起始页超过总页数 ' + totalPages, items: [], fromPage: fromPage, toPage: toPage, totalPages: totalPages };
-    }
+    if (fromPage > totalPages) return { error: '起始页超过总页数 ' + totalPages, items: [], fromPage: fromPage, toPage: toPage, totalPages: totalPages };
     toPage = Math.min(toPage, totalPages);
     var pages = [probe];
     if (fromPage === toPage) return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
-
     var rest = [];
     for (var p = fromPage + 1; p <= toPage; p++) rest.push(p);
-    var restResults = await mapPool(rest, LIST_CONCURRENCY, function (p) {
-      return listMarketPage(p, pageSize);
-    });
+    var restResults = await mapPool(rest, LIST_CONCURRENCY, function (p) { return listMarketPage(p, pageSize); });
     for (var i = 0; i < restResults.length; i++) pages.push(restResults[i]);
     return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
   }
 
+  /* ---------- IndexedDB ---------- */
+  function idbOpen() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE, { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error || new Error('idb open failed')); };
+    });
+  }
+  async function idbPutMany(items) {
+    if (!items || !items.length) return;
+    var db = await idbOpen();
+    await new Promise(function (resolve, reject) {
+      var tx = db.transaction(IDB_STORE, 'readwrite');
+      var store = tx.objectStore(IDB_STORE);
+      for (var i = 0; i < items.length; i++) store.put(items[i]);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error || new Error('idb put failed')); };
+    });
+    db.close();
+  }
+  async function idbGetAll() {
+    var db = await idbOpen();
+    var items = await new Promise(function (resolve, reject) {
+      var tx = db.transaction(IDB_STORE, 'readonly');
+      var req = tx.objectStore(IDB_STORE).getAll();
+      req.onsuccess = function () { resolve(req.result || []); };
+      req.onerror = function () { reject(req.error || new Error('idb getAll failed')); };
+    });
+    db.close();
+    return items;
+  }
+
+  function itemFromIndexRec(rec) {
+    if (!rec || rec.id == null || !rec.ahash) return null;
+    return {
+      id: rec.id,
+      name: brandText(rec.name || ''),
+      image: rec.image || '',
+      ahash: typeof rec.ahash === 'string' ? b64ToAhash(rec.ahash) : rec.ahash,
+      colors: rec.colors || [],
+      views: rec.views || 0,
+      likes: rec.likes || 0,
+    };
+  }
+  function recFromRoleFeat(role, feat) {
+    return {
+      id: role.id,
+      name: role.name || '',
+      image: role.image || '',
+      ahash: ahashToB64(feat.ahash),
+      colors: colorsToArr(feat.colors),
+      views: role.views || 0,
+      likes: role.likes || 0,
+      updatedAt: Date.now(),
+    };
+  }
+  function refreshIndexMap(recs) {
+    state.indexMap = Object.create(null);
+    for (var i = 0; i < recs.length; i++) {
+      var it = itemFromIndexRec(recs[i]);
+      if (it) state.indexMap[String(it.id)] = it;
+    }
+    state.indexCount = Object.keys(state.indexMap).length;
+  }
+  function updateIndexInfo(extra) {
+    var el = $('indexInfo');
+    if (!el) return;
+    var cloud = state.blobEnabled ? '云端可写' : '仅本地';
+    el.textContent = '索引：本地 ' + state.indexCount + ' 条 · ' + cloud + (extra ? ' · ' + extra : '');
+  }
+
+  async function loadLocalIndex() {
+    try {
+      var recs = await idbGetAll();
+      refreshIndexMap(recs);
+      updateIndexInfo('已加载');
+    } catch (e) {
+      updateIndexInfo('本地索引不可用');
+    }
+  }
+  async function loadCloudIndex() {
+    try {
+      var res = await fetch('/api/cover-index', { cache: 'no-store' });
+      var data = await res.json();
+      state.blobEnabled = !!(data && data.data && data.data.blobEnabled);
+      var items = data && data.data && data.data.index && data.data.index.items;
+      if (Array.isArray(items) && items.length) {
+        await idbPutMany(items);
+        var recs = await idbGetAll();
+        refreshIndexMap(recs);
+        updateIndexInfo('已同步云端 ' + items.length);
+      } else {
+        updateIndexInfo(state.blobEnabled ? '云端空索引' : '未配置云端 Blob');
+      }
+    } catch (e) {
+      updateIndexInfo('云端索引读取失败');
+    }
+  }
+  async function pushCloudIndex(recs) {
+    if (!state.blobEnabled) return { ok: false, message: '未配置云端' };
+    try {
+      var res = await fetch('/api/cover-index', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index: { v: 1, items: recs } }),
+      });
+      var data = await res.json();
+      if (!res.ok || data.status !== 'success') {
+        return { ok: false, message: (data && data.message) || ('HTTP ' + res.status) };
+      }
+      return { ok: true, count: data.data && data.data.count };
+    } catch (e) {
+      return { ok: false, message: String(e.message || e) };
+    }
+  }
+
+  function cancelWork(msg) {
+    state.imgToken = (state.imgToken || 0) + 1;
+    state.imgBusy = false;
+    if (msg) setMsg($('status'), msg, 'ok');
+  }
+
+  function getMinScore() {
+    var n = parseInt(($('imgMinScore') && $('imgMinScore').value) || '60', 10);
+    if (!isFinite(n)) n = 60;
+    if (n < 30) n = 30;
+    if (n > 95) n = 95;
+    return n;
+  }
+  function getPageRange() {
+    var fromPage = parseInt(($('imgPageFrom') && $('imgPageFrom').value) || '1', 10);
+    var toPage = parseInt(($('imgPageTo') && $('imgPageTo').value) || String(fromPage), 10);
+    if (!isFinite(fromPage) || fromPage < 1) fromPage = 1;
+    if (!isFinite(toPage) || toPage < 1) toPage = fromPage;
+    if (toPage < fromPage) { var tmp = fromPage; fromPage = toPage; toPage = tmp; }
+    if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
+    if ($('imgPageFrom')) $('imgPageFrom').value = String(fromPage);
+    if ($('imgPageTo')) $('imgPageTo').value = String(toPage);
+    return { fromPage: fromPage, toPage: toPage };
+  }
+
+  /* ---------- render ---------- */
   function cardHtml(item) {
     var img = item.image || '';
     var name = item.name || '';
@@ -348,8 +504,7 @@
       for (var i = 0; i < muts.length; i++) {
         var m = muts[i];
         if (m.type === 'characterData' && m.target && m.target.nodeType === 3) {
-          var v = m.target.nodeValue;
-          var n = brandText(v);
+          var v = m.target.nodeValue; var n = brandText(v);
           if (n !== v) m.target.nodeValue = n;
         } else if (m.addedNodes) {
           for (var j = 0; j < m.addedNodes.length; j++) {
@@ -365,21 +520,18 @@
     });
     mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   }
-
   function setImgModeUI(on) {
     var clearBtn = $('btnClearImgSearch');
     var pager = $('pager');
     if (clearBtn) clearBtn.classList.toggle('hidden', !on);
     if (pager) pager.style.display = on ? 'none' : '';
   }
-
   function renderImgResults(list) {
     var grid = $('grid');
     if (!list.length) {
-      grid.innerHTML = '<div class="empty">未找到相似封面（可增大扫描页数或换图）</div>';
+      grid.innerHTML = '<div class="empty">没有达到阈值的高相似封面</div>';
       return;
     }
-    // highest relevance first (already sorted)
     var top = list.slice(0, 60);
     top.forEach(function (it, idx) { it._rank = idx + 1; });
     grid.innerHTML = top.map(cardHtml).join('');
@@ -387,117 +539,137 @@
     scrubTextNodes(grid);
   }
 
-  async function runImageSearch() {
+  /* ---------- build index (scan once, store) ---------- */
+  async function buildIndex() {
     if (state.imgBusy) return;
-    if (!state.imgQueryFeat) {
-      setMsg($('status'), '请先选择一张图片', 'err');
-      return;
-    }
-    var fromPage = parseInt(($('imgPageFrom') && $('imgPageFrom').value) || '1', 10);
-    var toPage = parseInt(($('imgPageTo') && $('imgPageTo').value) || String(fromPage), 10);
-    if (!isFinite(fromPage) || fromPage < 1) fromPage = 1;
-    if (!isFinite(toPage) || toPage < 1) toPage = fromPage;
-    if (toPage < fromPage) { var tmp = fromPage; fromPage = toPage; toPage = tmp; }
-    if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
-    if ($('imgPageFrom')) $('imgPageFrom').value = String(fromPage);
-    if ($('imgPageTo')) $('imgPageTo').value = String(toPage);
-
+    var range = getPageRange();
     state.imgBusy = true;
-    state.mode = 'img';
-    state.imgToken = (state.imgToken || 0) + 1;
+    state.imgToken += 1;
     var token = state.imgToken;
-    setImgModeUI(true);
     var status = $('status');
-    var grid = $('grid');
-    grid.innerHTML = '<div class="empty">搜图中…</div>';
-
-    var live = [];
-    var liveMap = Object.create(null);
-    var lastPaint = 0;
-
-    function paintLive(force) {
-      var now = Date.now();
-      if (!force && now - lastPaint < 280) return;
-      lastPaint = now;
-      var arr = live.slice().sort(function (a, b) { return b.score - a.score; });
-      state.imgResults = arr;
-      renderImgResults(arr);
-    }
-
     try {
       state.search = $('searchInput').value.trim();
       state.tag = $('tagInput').value.trim();
       state.sort = $('sortSelect').value;
-
-      var pageSize = 30;
-      setMsg(status, '并行拉取列表 ' + fromPage + '-' + toPage + ' 页…');
-      var listed = await fetchListPagesParallel(fromPage, toPage, pageSize);
+      setMsg(status, '更新索引：拉列表 ' + range.fromPage + '-' + range.toPage + '…');
+      var listed = await fetchListPagesParallel(range.fromPage, range.toPage, 30);
       if (token !== state.imgToken) return;
-      if (listed.error) {
-        setMsg(status, listed.error, 'err');
-        grid.innerHTML = '<div class="empty">列表失败</div>';
-        return;
-      }
+      if (listed.error) { setMsg(status, listed.error, 'err'); return; }
 
-      var all = [];
+      var roles = [];
       var seen = Object.create(null);
       for (var pi = 0; pi < listed.items.length; pi++) {
         var r = listed.items[pi];
         if (!r || r.status !== 'success') continue;
-        var data = r.data || {};
-        var raw = Array.isArray(data.items) ? data.items : [];
+        var raw = Array.isArray(r.data && r.data.items) ? r.data.items : [];
         for (var i = 0; i < raw.length; i++) {
           var role = sanitizeRole(raw[i]);
           if (!role || !role.image) continue;
           var key = String(role.id);
           if (seen[key]) continue;
           seen[key] = 1;
-          all.push(role);
+          // skip if already indexed with same image
+          var old = state.indexMap[key];
+          if (old && old.image === role.image && old.ahash) continue;
+          roles.push(role);
         }
       }
 
-      setMsg(status, '比对封面 0/' + all.length + '（并发加速）…');
-      var done = 0;
+      setMsg(status, '更新索引：提取特征 0/' + roles.length + '（已有可跳过）…');
+      var newRecs = [];
       var t0 = Date.now();
-      await mapPool(all, FEAT_CONCURRENCY, async function (item) {
+      await mapPool(roles, FEAT_CONCURRENCY, async function (role) {
         if (token !== state.imgToken) return null;
         try {
-          var feat = await featuresFromSrc(item.image);
-          item.score = similarityScore(state.imgQueryFeat, feat);
-        } catch (e) {
-          item.score = -1;
-        }
-        if (item.score >= 0) {
-          if (!liveMap[item.id] || item.score > liveMap[item.id].score) {
-            if (liveMap[item.id]) {
-              // replace existing
-              for (var k = 0; k < live.length; k++) {
-                if (live[k].id === item.id) { live[k] = item; break; }
-              }
-            } else {
-              live.push(item);
-            }
-            liveMap[item.id] = item;
-          }
-        }
-        return item;
+          var feat = await featuresFromSrc(role.image);
+          var rec = recFromRoleFeat(role, feat);
+          newRecs.push(rec);
+          // update memory immediately
+          var it = itemFromIndexRec(rec);
+          if (it) state.indexMap[String(it.id)] = it;
+          return rec;
+        } catch (e) { return null; }
       }, function (d, total) {
         if (token !== state.imgToken) return;
-        done = d;
-        if (d % 6 === 0 || d === total) {
-          var sec = ((Date.now() - t0) / 1000).toFixed(1);
-          setMsg(status, '比对封面 ' + d + '/' + total + ' · ' + sec + 's');
-          paintLive(false);
+        if (d % 5 === 0 || d === total) {
+          setMsg(status, '更新索引：提取特征 ' + d + '/' + total + ' · 新增 ' + newRecs.length);
         }
       });
+      if (token !== state.imgToken) return;
 
+      if (newRecs.length) await idbPutMany(newRecs);
+      var allRecs = await idbGetAll();
+      refreshIndexMap(allRecs);
+      var cloud = await pushCloudIndex(allRecs);
+      var sec = ((Date.now() - t0) / 1000).toFixed(1);
+      updateIndexInfo(cloud.ok ? ('已上传云端 ' + (cloud.count || allRecs.length)) : (cloud.message || '仅本地'));
+      setMsg(status, '索引完成：新增 ' + newRecs.length + ' · 总计 ' + state.indexCount + ' · ' + sec + 's' + (cloud.ok ? ' · 已同步 Vercel' : ' · 本地已保存'), 'ok');
+    } catch (e) {
+      if (token === state.imgToken) setMsg(status, String(e.message || e), 'err');
+    } finally {
+      if (token === state.imgToken) state.imgBusy = false;
+    }
+  }
+
+  /* ---------- search against index (no re-download) ---------- */
+  async function runImageSearch() {
+    if (state.imgBusy) return;
+    if (!state.imgQueryFeat) {
+      setMsg($('status'), '请先选择一张图片', 'err');
+      return;
+    }
+    if (state.indexCount < 1) {
+      setMsg($('status'), '索引为空：先点「更新索引」扫描页范围', 'err');
+      return;
+    }
+
+    state.imgBusy = true;
+    state.mode = 'img';
+    state.imgToken += 1;
+    var token = state.imgToken;
+    setImgModeUI(true);
+    var status = $('status');
+    var grid = $('grid');
+    grid.innerHTML = '<div class="empty">索引比对中…</div>';
+
+    try {
+      var minScore = getMinScore();
+      var q = state.imgQueryFeat;
+      var ids = Object.keys(state.indexMap);
+      var live = [];
+      var t0 = Date.now();
+      var checked = 0, passedHash = 0;
+
+      // pure CPU compare, chunked to keep UI responsive
+      for (var i = 0; i < ids.length; i++) {
+        if (token !== state.imgToken) return;
+        var it = state.indexMap[ids[i]];
+        checked++;
+        var hs = hashSimilarity(q, it);
+        if (hs < HASH_GATE) continue; // 低相似直接丢弃，不算颜色
+        passedHash++;
+        var score = similarityScore(q, it);
+        if (score < minScore) continue; // 只保留高相似
+        live.push({
+          id: it.id,
+          name: it.name,
+          image: it.image,
+          views: it.views || 0,
+          likes: it.likes || 0,
+          score: score,
+        });
+        if (checked % 200 === 0) {
+          setMsg(status, '索引比对 ' + checked + '/' + ids.length + ' · 高相似 ' + live.length);
+          await new Promise(function (r) { setTimeout(r, 0); });
+        }
+      }
       if (token !== state.imgToken) return;
       live.sort(function (a, b) { return b.score - a.score; });
       state.imgResults = live;
-      paintLive(true);
+      renderImgResults(live);
       var best = live[0] ? Math.round(live[0].score) : 0;
-      var sec = ((Date.now() - t0) / 1000).toFixed(1);
-      setMsg(status, '完成：页 ' + fromPage + '-' + (listed.toPage || toPage) + ' · ' + live.length + '/' + all.length + ' 张 · 最高相关 ' + best + '% · 耗时 ' + sec + 's', 'ok');
+      var sec = ((Date.now() - t0) / 1000).toFixed(2);
+      setMsg(status, '完成：索引 ' + checked + ' · 粗筛通过 ' + passedHash + ' · 高相似 ' + live.length + ' · 最高 ' + best + '% · ' + sec + 's', 'ok');
     } catch (e) {
       if (token === state.imgToken) {
         setMsg(status, String(e.message || e), 'err');
@@ -509,10 +681,7 @@
   }
 
   async function loadMarket() {
-    if (state.mode === 'img') {
-      // browsing returns from img mode only via clear
-      return;
-    }
+    if (state.mode === 'img') return;
     var status = $('status');
     var grid = $('grid');
     setMsg(status, '加载中…');
@@ -529,9 +698,8 @@
       state.total = Number(data.total != null ? data.total : items.length) || 0;
       state.totalPages = Number(data.total_pages != null ? data.total_pages : data.totalPages) || 1;
       if (state.totalPages < 1) state.totalPages = 1;
-      if (!items.length) {
-        grid.innerHTML = '<div class="empty">暂无角色</div>';
-      } else {
+      if (!items.length) grid.innerHTML = '<div class="empty">暂无角色</div>';
+      else {
         grid.innerHTML = items.map(cardHtml).join('');
         paintCovers(grid);
       }
@@ -542,11 +710,9 @@
         pageInput.value = String(state.page);
         pageInput.placeholder = '1-' + state.totalPages;
       }
-      // keep range inputs in valid bounds (do not overwrite user to-page)
-      var pf = $('imgPageFrom');
-      var pt = $('imgPageTo');
-      if (pf) { pf.max = String(state.totalPages); if (!pf.value) pf.value = String(state.page); }
-      if (pt) { pt.max = String(state.totalPages); if (!pt.value) pt.value = String(Math.min(state.totalPages, state.page + 5)); }
+      var pf = $('imgPageFrom'); var pt = $('imgPageTo');
+      if (pf) pf.max = String(state.totalPages);
+      if (pt) pt.max = String(state.totalPages);
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
       scrubTextNodes(grid);
     } catch (e) {
@@ -559,19 +725,11 @@
     function goPage(raw) {
       if (state.mode === 'img') return;
       var n = parseInt(raw, 10);
-      if (!isFinite(n)) {
-        setMsg($('status'), '请输入有效页码', 'err');
-        return;
-      }
+      if (!isFinite(n)) { setMsg($('status'), '请输入有效页码', 'err'); return; }
       if (n < 1) n = 1;
       if (state.totalPages > 0 && n > state.totalPages) n = state.totalPages;
-      if (n === state.page) {
-        setMsg($('status'), '已在第 ' + n + ' 页', 'ok');
-        return;
-      }
-      state.page = n;
-      loadMarket();
-      window.scrollTo(0, 0);
+      if (n === state.page) { setMsg($('status'), '已在第 ' + n + ' 页', 'ok'); return; }
+      state.page = n; loadMarket(); window.scrollTo(0, 0);
     }
 
     $('btnSearch').onclick = function () {
@@ -579,13 +737,8 @@
       state.tag = $('tagInput').value.trim();
       state.sort = $('sortSelect').value;
       state.page = 1;
-      if (state.mode === 'img' && state.imgQueryFeat) {
-        runImageSearch();
-        return;
-      }
-      state.mode = 'browse';
-      setImgModeUI(false);
-      loadMarket();
+      if (state.mode === 'img') { runImageSearch(); return; }
+      state.mode = 'browse'; setImgModeUI(false); loadMarket();
     };
     $('searchInput').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
     $('btnPrev').onclick = function () { if (state.page > 1) { state.page--; loadMarket(); window.scrollTo(0, 0); } };
@@ -600,17 +753,25 @@
         if (state.imgQueryUrl) URL.revokeObjectURL(state.imgQueryUrl);
         state.imgQueryUrl = URL.createObjectURL(file);
         var prev = $('imgSearchPreview');
-        prev.src = state.imgQueryUrl;
-        prev.classList.remove('hidden');
+        prev.src = state.imgQueryUrl; prev.classList.remove('hidden');
         state.imgQueryFeat = await featuresFromSrc(state.imgQueryUrl);
-        setMsg($('status'), '图片已就绪，点击「以图搜图」', 'ok');
+        setMsg($('status'), '图片已就绪：可「以图搜图」(走索引) 或先「更新索引」', 'ok');
       } catch (err) {
         state.imgQueryFeat = null;
         setMsg($('status'), '图片读取失败：' + (err.message || err), 'err');
       }
     };
+
+    $('btnBuildIndex').onclick = function () { buildIndex(); };
     $('btnImgSearch').onclick = function () { runImageSearch(); };
+    $('btnCancelImg').onclick = function () {
+      cancelWork('已取消');
+      if (state.mode === 'img' && state.imgResults && state.imgResults.length) {
+        renderImgResults(state.imgResults);
+      }
+    };
     $('btnClearImgSearch').onclick = function () {
+      cancelWork('已退出搜图');
       state.mode = 'browse';
       state.imgResults = [];
       setImgModeUI(false);
@@ -618,9 +779,11 @@
     };
   }
 
-  function boot() {
+  async function boot() {
     watchDom();
     bind();
+    await loadLocalIndex();
+    loadCloudIndex(); // non-blocking-ish
     loadMarket();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

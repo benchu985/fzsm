@@ -8,3 +8,4 @@ dev.log
 dev.pid
 *.log
 evidence_market.json
+node_modules/
