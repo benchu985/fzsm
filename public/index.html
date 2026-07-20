@@ -46,8 +46,20 @@
         <button type="button" class="btn ghost hidden" id="btnClearImgSearch">退出搜图</button>
       </div>
       <div id="imgQueryStrip" class="query-strip hidden" aria-label="已上传图片"></div>
-      <div id="indexInfo" class="index-info">云端索引：加载中…</div>
-      <div class="index-tip">访问时会在后台检查并补齐最新封面索引</div>
+      <div class="index-build-row">
+        <label class="scan-label">从
+          <input class="field page-input" id="indexFromPage" type="number" min="1" value="1" inputmode="numeric" />
+          页
+        </label>
+        <label class="scan-label">到
+          <input class="field page-input" id="indexToPage" type="number" min="1" value="10" inputmode="numeric" />
+          页
+        </label>
+        <button type="button" class="btn primary" id="btnBuildIndex">创建索引</button>
+        <button type="button" class="btn ghost hidden" id="btnCancelIndex">取消创建</button>
+      </div>
+      <div id="indexInfo" class="index-info">本地索引：加载中…</div>
+      <div class="index-tip">创建索引会清空旧索引，并按所选页数重新保存到当前浏览器</div>
 
       <div id="status" class="status"></div>
       <div class="grid" id="grid"></div>

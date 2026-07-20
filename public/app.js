@@ -1,4 +1,4 @@
-/* Sm cover-only viewer + cover feature index (local IDB / optional Vercel Blob) */
+/* Sm cover-only viewer + browser-local cover feature index */
 (function () {
   'use strict';
 
@@ -9,7 +9,6 @@
   var IDB_NAME = 'fzsm_cover_index';
   var IDB_STORE = 'items';
   var FEAT_CONCURRENCY = 14;
-  var LIST_CONCURRENCY = 4;
   // fast reject: aHash similarity below this => skip (0..1)
   var HASH_GATE = 0.70; // structure-only coarse gate; reject color-only lookalikes
 
@@ -29,9 +28,9 @@
     imgBusy: false,
     imgToken: 0,
     indexCount: 0,
-    blobEnabled: false,
-    syncBusy: false,
-    autoSyncChecked: false,
+    indexBuildBusy: false,
+    indexBuildToken: 0,
+    indexMeta: null,
     indexMap: Object.create(null), // id -> {id,name,image,ahash,dhash,colors}
   };
 
@@ -139,15 +138,6 @@
   async function listMarket() { return listMarketPage(state.page, state.pageSize); }
 
   /* ---------- feature codec ---------- */
-  function ahashToB64(ahash) {
-    var bytes = new Uint8Array(8);
-    for (var i = 0; i < 64; i++) {
-      if (ahash[i]) bytes[i >> 3] |= (1 << (7 - (i & 7)));
-    }
-    var s = '';
-    for (var j = 0; j < bytes.length; j++) s += String.fromCharCode(bytes[j]);
-    return btoa(s);
-  }
   function b64ToAhash(b) {
     var bin = atob(b || '');
     var ahash = new Uint8Array(64);
@@ -260,11 +250,11 @@
     return { ahash: ahash, dhash: dhash, luma: luma, colors: colors };
   }
 
-  async function featuresFromSrc(src) {
-    if (featCache[src]) return featCache[src];
+  async function featuresFromSrc(src, useCache) {
+    if (useCache !== false && featCache[src]) return featCache[src];
     var img = await loadImageEl(src);
     var feat = extractFeaturesFromImage(img);
-    featCache[src] = feat;
+    if (useCache !== false) featCache[src] = feat;
     return feat;
   }
 
@@ -326,26 +316,7 @@
     });
   }
 
-  async function fetchListPagesParallel(fromPage, toPage, pageSize) {
-    fromPage = Math.max(1, fromPage | 0);
-    toPage = Math.max(fromPage, toPage | 0);
-    if (toPage - fromPage + 1 > 80) toPage = fromPage + 79;
-    var probe = await listMarketPage(fromPage, pageSize);
-    if (probe.status !== 'success') return { error: probe.message || '列表失败', items: [], fromPage: fromPage, toPage: toPage, totalPages: 0 };
-    var data = probe.data || {};
-    var totalPages = Number(data.total_pages != null ? data.total_pages : data.totalPages) || 1;
-    if (fromPage > totalPages) return { error: '起始页超过总页数 ' + totalPages, items: [], fromPage: fromPage, toPage: toPage, totalPages: totalPages };
-    toPage = Math.min(toPage, totalPages);
-    var pages = [probe];
-    if (fromPage === toPage) return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
-    var rest = [];
-    for (var p = fromPage + 1; p <= toPage; p++) rest.push(p);
-    var restResults = await mapPool(rest, LIST_CONCURRENCY, function (p) { return listMarketPage(p, pageSize); });
-    for (var i = 0; i < restResults.length; i++) pages.push(restResults[i]);
-    return { items: pages, fromPage: fromPage, toPage: toPage, totalPages: totalPages };
-  }
-
-  /* ---------- IndexedDB + cloud manual index ---------- */
+  /* ---------- browser-local manual index ---------- */
   function idbOpen() {
     return new Promise(function (resolve, reject) {
       var req = indexedDB.open(IDB_NAME, 1);
@@ -380,6 +351,16 @@
     db.close();
     return items;
   }
+  async function idbClear() {
+    var db = await idbOpen();
+    await new Promise(function (resolve, reject) {
+      var tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).clear();
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error || new Error('idb clear failed')); };
+    });
+    db.close();
+  }
   function itemFromIndexRec(rec) {
     if (!rec || rec.id == null || !rec.ahash) return null;
     return {
@@ -402,142 +383,149 @@
     }
     state.indexCount = Object.keys(state.indexMap).length;
   }
-  function fmtTime(ts) {
-    if (!ts) return '-';
-    try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts); }
-  }
   function updateIndexInfo(extra) {
     var el = $('indexInfo');
     if (!el) return;
-    var crawl = state.crawl || {};
-    var prog = '';
-    var mode = crawl.mode || '';
-    var nearFull = state.indexCount >= 8000 || crawl.done || mode === 'newest' || mode === 'local-full';
-    if (nearFull) {
-      prog = ' · 仅同步新图';
-    } else if (crawl.totalPages) {
-      prog = ' · 全库进度 ' + (crawl.nextPage || 1) + '/' + crawl.totalPages;
+    var range = '';
+    if (state.indexMeta && state.indexMeta.fromPage) {
+      var shownTo = state.indexMeta.partial ? Math.max(state.indexMeta.fromPage, state.indexMeta.lastPage || 0) : state.indexMeta.toPage;
+      range = ' · 页 ' + state.indexMeta.fromPage + '-' + shownTo + (state.indexMeta.partial ? '（未完成）' : '');
     }
-    el.textContent = '云端索引：' + state.indexCount + ' 条' + prog +
-      (state.indexUpdatedAt ? (' · 更新 ' + fmtTime(state.indexUpdatedAt)) : '') +
-      (extra ? (' · ' + extra) : '');
+    el.textContent = '本地索引：' + state.indexCount + ' 条' + range + (extra ? (' · ' + extra) : '');
   }
   async function loadLocalIndex() {
     try {
       var recs = await idbGetAll();
+      try { state.indexMeta = JSON.parse(localStorage.getItem('fzsm_local_index_meta') || 'null'); } catch (e) { state.indexMeta = null; }
+      // Remove indexes imported by older cloud-enabled builds.
+      if (!state.indexMeta && recs.length) {
+        await idbClear();
+        recs = [];
+      }
       refreshIndexMap(recs);
+      if (state.indexMeta) {
+        if ($('indexFromPage')) $('indexFromPage').value = String(state.indexMeta.fromPage || 1);
+        if ($('indexToPage')) $('indexToPage').value = String(state.indexMeta.toPage || state.indexMeta.fromPage || 1);
+      }
       updateIndexInfo('本地缓存');
     } catch (e) {
       updateIndexInfo('本地缓存不可用');
     }
   }
-  async function loadCloudIndex() {
-    try {
-      updateIndexInfo('拉取云端…');
-      var res = await fetch('/api/cover-index', { cache: 'no-store' });
-      var data = await res.json();
-      state.blobEnabled = !!(data && data.data && data.data.blobEnabled);
-      var index = data && data.data && data.data.index;
-      var items = index && Array.isArray(index.items) ? index.items : [];
-      state.crawl = (data && data.data && data.data.crawl) || (index && index.crawl) || null;
-      state.indexUpdatedAt = (data && data.data && data.data.updatedAt) || (index && index.updatedAt) || 0;
-      if (items.length) {
-        await idbPutMany(items);
-        refreshIndexMap(items);
-      }
-      var extra = state.blobEnabled ? '已读取云端' : 'Blob未配置';
-      updateIndexInfo(extra);
-      return true;
-    } catch (e) {
-      updateIndexInfo('云端读取失败');
-      return false;
-    }
+  async function listIndexPage(page, pageSize) {
+    return post('/role_market.php', {
+      action: 'list',
+      page: page,
+      page_size: pageSize,
+      sort: mapSort('最新'),
+      tag: '',
+      search: '',
+      device_id: getDeviceId(),
+    });
   }
-  async function collectNewestSeedItems(pages, pageSize) {
-    pages = Math.max(1, Math.min(4, pages || 2));
-    pageSize = pageSize || 50;
-    var seed = [];
-    var seen = Object.create(null);
-    for (var p = 1; p <= pages; p++) {
-      var res = await post('/role_market.php', {
-        action: 'list',
-        page: p,
-        page_size: pageSize,
-        sort: mapSort('最新'),
-        tag: '',
-        search: '',
-        device_id: getDeviceId(),
-      });
-      if (!res || res.status !== 'success') {
-        throw new Error((res && res.message) || ('列表第' + p + '页失败'));
-      }
-      var data = res.data || {};
-      var items = Array.isArray(data.items) ? data.items : [];
-      for (var i = 0; i < items.length; i++) {
-        var role = items[i];
-        if (!role || role.id == null || seen[String(role.id)]) continue;
-        seen[String(role.id)] = 1;
-        var cover = role.cover_url || role.image || '';
-        if (!cover) continue;
-        seed.push({
-          id: role.id,
-          name: role.name || '',
-          cover_url: cover,
-          view_count: role.view_count != null ? role.view_count : (role.views || 0),
-          like_count: role.like_count != null ? role.like_count : (role.likes || 0),
+
+  async function buildLocalIndex() {
+    if (state.indexBuildBusy) return;
+    var fromPage = parseInt(($('indexFromPage') && $('indexFromPage').value) || '1', 10);
+    var toPage = parseInt(($('indexToPage') && $('indexToPage').value) || String(fromPage), 10);
+    if (!isFinite(fromPage) || !isFinite(toPage) || fromPage < 1 || toPage < fromPage) {
+      setMsg($('status'), '请输入有效的索引页数范围', 'err');
+      return;
+    }
+
+    state.indexBuildBusy = true;
+    state.indexBuildToken += 1;
+    var token = state.indexBuildToken;
+    var buildBtn = $('btnBuildIndex');
+    var cancelBtn = $('btnCancelIndex');
+    if (buildBtn) buildBtn.disabled = true;
+    if (cancelBtn) cancelBtn.classList.remove('hidden');
+
+    try {
+      updateIndexInfo('检查页数…');
+      var first = await listIndexPage(fromPage, 50);
+      if (!first || first.status !== 'success') throw new Error((first && first.message) || '列表读取失败');
+      var firstData = first.data || {};
+      var totalPages = Number(firstData.total_pages != null ? firstData.total_pages : firstData.totalPages) || toPage;
+      if (fromPage > totalPages) throw new Error('起始页超过总页数 ' + totalPages);
+      toPage = Math.min(toPage, totalPages);
+      if ($('indexToPage')) $('indexToPage').value = String(toPage);
+
+      await idbClear();
+      refreshIndexMap([]);
+      state.indexMeta = { fromPage: fromPage, toPage: toPage, lastPage: fromPage - 1, partial: true, updatedAt: Date.now() };
+      localStorage.setItem('fzsm_local_index_meta', JSON.stringify(state.indexMeta));
+      var failed = 0;
+
+      for (var page = fromPage; page <= toPage; page++) {
+        if (token !== state.indexBuildToken) throw new Error('INDEX_CANCELLED');
+        var response = page === fromPage ? first : await listIndexPage(page, 50);
+        if (!response || response.status !== 'success') throw new Error((response && response.message) || ('第 ' + page + ' 页读取失败'));
+        var data = response.data || {};
+        var roles = Array.isArray(data.items) ? data.items : [];
+        updateIndexInfo('处理第 ' + page + '/' + toPage + ' 页…');
+        var records = await mapPool(roles, FEAT_CONCURRENCY, async function (role) {
+          if (token !== state.indexBuildToken) return null;
+          var item = sanitizeRole(role);
+          if (!item || !item.image) return null;
+          try {
+            var feat = await featuresFromSrc(item.image, false);
+            if (token !== state.indexBuildToken) return null;
+            return {
+              id: item.id,
+              name: item.name,
+              image: item.image,
+              ahash: feat.ahash,
+              dhash: feat.dhash,
+              luma: feat.luma,
+              colors: colorsToArr(feat.colors),
+              views: item.views || 0,
+              likes: item.likes || 0,
+              page: page,
+              updatedAt: Date.now(),
+            };
+          } catch (e) {
+            failed++;
+            return null;
+          }
         });
+        records = records.filter(Boolean);
+        await idbPutMany(records);
+        for (var i = 0; i < records.length; i++) {
+          var indexed = itemFromIndexRec(records[i]);
+          if (indexed) state.indexMap[String(indexed.id)] = indexed;
+        }
+        state.indexCount = Object.keys(state.indexMap).length;
+        state.indexMeta.lastPage = page;
+        state.indexMeta.updatedAt = Date.now();
+        localStorage.setItem('fzsm_local_index_meta', JSON.stringify(state.indexMeta));
+        updateIndexInfo('第 ' + page + '/' + toPage + ' 页 · 失败 ' + failed);
+        await new Promise(function (resolve) { setTimeout(resolve, 0); });
       }
-    }
-    return seed;
-  }
 
-  function smartSyncPages(missing) {
-    if (missing <= 0) return 0;
-    if (missing <= 40) return 1;
-    if (missing <= 90) return 2;
-    if (missing <= 140) return 3;
-    return 4;
-  }
-
-  async function autoSyncIndex() {
-    if (state.syncBusy || state.autoSyncChecked) return;
-    state.autoSyncChecked = true;
-    var marketTotal = Number(state.total) || 0;
-    var missing = marketTotal - state.indexCount;
-    var pages = smartSyncPages(missing);
-    if (!state.blobEnabled || !marketTotal) {
-      updateIndexInfo(state.blobEnabled ? '等待市场总数' : 'Blob未配置');
-      return;
-    }
-    if (!pages) {
-      updateIndexInfo('索引已是最新');
-      return;
-    }
-    state.syncBusy = true;
-    try {
-      updateIndexInfo('后台补齐 ' + missing + ' 条…');
-      // Vercel 出口会被 Cloudflare 拦，改由浏览器拉列表，服务端只算特征/写 Blob。
-      var seedItems = await collectNewestSeedItems(pages, 50);
-      var res = await fetch('/api/cover-index', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'seed', seedItems: seedItems }),
-        cache: 'no-store',
-      });
-      var data = await res.json();
-      if (!res.ok || (data && data.status === 'error')) {
-        throw new Error((data && data.message) || ('HTTP ' + res.status));
-      }
-      var result = data && data.data ? data.data : {};
-      await loadCloudIndex();
-      var added = result.added != null ? result.added : 0;
-      var errN = result.errors != null ? result.errors : 0;
-      updateIndexInfo('后台同步 +' + added + (errN ? (' / 失败 ' + errN) : ''));
+      state.indexMeta = { fromPage: fromPage, toPage: toPage, lastPage: toPage, partial: false, updatedAt: Date.now() };
+      localStorage.setItem('fzsm_local_index_meta', JSON.stringify(state.indexMeta));
+      updateIndexInfo('创建完成' + (failed ? (' · 失败 ' + failed) : ''));
+      setMsg($('status'), '本地索引创建完成：' + state.indexCount + ' 条', 'ok');
     } catch (e) {
-      updateIndexInfo('后台同步失败');
+      if (String(e && e.message) === 'INDEX_CANCELLED') {
+        updateIndexInfo('已取消');
+        setMsg($('status'), '已取消创建索引，当前保留 ' + state.indexCount + ' 条', 'ok');
+      } else {
+        updateIndexInfo('创建失败');
+        setMsg($('status'), '创建索引失败：' + (e.message || e), 'err');
+      }
     } finally {
-      state.syncBusy = false;
+      state.indexBuildBusy = false;
+      if (buildBtn) buildBtn.disabled = false;
+      if (cancelBtn) cancelBtn.classList.add('hidden');
     }
+  }
+
+  function cancelIndexBuild() {
+    if (!state.indexBuildBusy) return;
+    state.indexBuildToken += 1;
+    updateIndexInfo('正在取消…');
   }
   function cancelWork(msg) {
     state.imgToken = (state.imgToken || 0) + 1;
@@ -682,7 +670,7 @@
       return;
     }
     if (state.indexCount < 1) {
-      setMsg($('status'), '云端索引尚未就绪，请稍候后台同步', 'err');
+      setMsg($('status'), '请先选择页数并创建本地索引', 'err');
       return;
     }
 
@@ -780,6 +768,13 @@
         pageInput.value = String(state.page);
         pageInput.placeholder = '1-' + state.totalPages;
       }
+      var indexFrom = $('indexFromPage');
+      var indexTo = $('indexToPage');
+      if (indexFrom) indexFrom.max = String(state.totalPages);
+      if (indexTo) {
+        indexTo.max = String(state.totalPages);
+        if (Number(indexTo.value) > state.totalPages) indexTo.value = String(state.totalPages);
+      }
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
       scrubTextNodes(grid);
     } catch (e) {
@@ -853,6 +848,8 @@
     };
 
     $('btnImgSearch').onclick = function () { runImageSearch(); };
+    $('btnBuildIndex').onclick = function () { buildLocalIndex(); };
+    $('btnCancelIndex').onclick = function () { cancelIndexBuild(); };
     $('btnClearUploads').onclick = function () {
       cancelWork();
       clearUploadedImages();
@@ -882,9 +879,7 @@
   async function boot() {
     watchDom();
     bind();
-    await loadLocalIndex();
-    await Promise.all([loadCloudIndex(), loadMarket()]);
-    autoSyncIndex();
+    await Promise.all([loadLocalIndex(), loadMarket()]);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
