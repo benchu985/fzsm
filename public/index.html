@@ -33,19 +33,11 @@
       </div>
 
       <div class="index-build-row">
-        <label class="scan-label">从
-          <input class="field page-input" id="indexFromPage" type="number" min="1" value="1" inputmode="numeric" />
-          页
-        </label>
-        <label class="scan-label">到
-          <input class="field page-input" id="indexToPage" type="number" min="1" inputmode="numeric" placeholder="最新" />
-          页
-        </label>
         <button type="button" class="btn primary" id="btnBuildIndex">创建索引</button>
         <button type="button" class="btn ghost hidden" id="btnCancelIndex">取消创建</button>
       </div>
       <div id="indexInfo" class="index-info">本地索引：加载中…</div>
-      <div class="index-tip">默认创建第 1 页到最新页；更新时复用未变化封面的特征</div>
+      <div class="index-tip">创建范围为第 1 页到最新页；更新时复用未变化封面的特征</div>
 
       <div class="img-search-row">
         <label class="file-btn btn ghost">

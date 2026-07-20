@@ -406,10 +406,6 @@
         recs = [];
       }
       refreshIndexMap(recs);
-      if (state.indexMeta) {
-        if ($('indexFromPage')) $('indexFromPage').value = String(state.indexMeta.fromPage || 1);
-        if ($('indexToPage')) $('indexToPage').value = String(state.indexMeta.toPage || state.indexMeta.fromPage || 1);
-      }
       updateIndexInfo('本地缓存');
     } catch (e) {
       updateIndexInfo('本地缓存不可用');
@@ -429,13 +425,7 @@
 
   async function buildLocalIndex() {
     if (state.indexBuildBusy) return;
-    var fromPage = parseInt(($('indexFromPage') && $('indexFromPage').value) || '1', 10);
-    var toRaw = (($('indexToPage') && $('indexToPage').value) || '').trim();
-    var requestedTo = toRaw ? parseInt(toRaw, 10) : null;
-    if (!isFinite(fromPage) || fromPage < 1 || (requestedTo != null && (!isFinite(requestedTo) || requestedTo < fromPage))) {
-      setMsg($('status'), '请输入有效的索引页数范围', 'err');
-      return;
-    }
+    var fromPage = 1;
 
     state.indexBuildBusy = true;
     state.indexBuildToken += 1;
@@ -451,9 +441,7 @@
       if (!first || first.status !== 'success') throw new Error((first && first.message) || '列表读取失败');
       var firstData = first.data || {};
       var totalPages = Number(firstData.total_pages != null ? firstData.total_pages : firstData.totalPages) || fromPage;
-      if (fromPage > totalPages) throw new Error('起始页超过总页数 ' + totalPages);
-      var toPage = requestedTo == null ? totalPages : Math.min(requestedTo, totalPages);
-      if ($('indexToPage')) $('indexToPage').value = String(toPage);
+      var toPage = Math.max(fromPage, totalPages);
       state.indexBuildRange = { fromPage: fromPage, toPage: toPage, partial: false };
 
       var oldRecords = await idbGetAll();
@@ -812,13 +800,6 @@
         pageInput.max = String(state.totalPages);
         pageInput.value = String(state.page);
         pageInput.placeholder = '1-' + state.totalPages;
-      }
-      var indexFrom = $('indexFromPage');
-      var indexTo = $('indexToPage');
-      if (indexFrom) indexFrom.max = String(state.totalPages);
-      if (indexTo) {
-        indexTo.max = String(state.totalPages);
-        if (Number(indexTo.value) > state.totalPages) indexTo.value = String(state.totalPages);
       }
       setMsg(status, '共 ' + state.total + ' 个 · 仅展示封面', 'ok');
       scrubTextNodes(grid);
