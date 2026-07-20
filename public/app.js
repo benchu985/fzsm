@@ -8,7 +8,8 @@
   var DEVICE_KEY = 'sm_web_device_id';
   var IDB_NAME = 'fzsm_cover_index';
   var IDB_STORE = 'items';
-  var FEAT_CONCURRENCY = 14;
+  var FEAT_CONCURRENCY = 20;
+  var INDEX_LIST_CONCURRENCY = 6;
   // fast reject: aHash similarity below this => skip (0..1)
   var HASH_GATE = 0.70; // structure-only coarse gate; reject color-only lookalikes
 
@@ -30,6 +31,7 @@
     indexCount: 0,
     indexBuildBusy: false,
     indexBuildToken: 0,
+    indexBuildRange: null,
     indexMeta: null,
     indexMap: Object.create(null), // id -> {id,name,image,ahash,dhash,colors}
   };
@@ -328,18 +330,6 @@
       req.onerror = function () { reject(req.error || new Error('idb open failed')); };
     });
   }
-  async function idbPutMany(items) {
-    if (!items || !items.length) return;
-    var db = await idbOpen();
-    await new Promise(function (resolve, reject) {
-      var tx = db.transaction(IDB_STORE, 'readwrite');
-      var store = tx.objectStore(IDB_STORE);
-      for (var i = 0; i < items.length; i++) store.put(items[i]);
-      tx.oncomplete = function () { resolve(); };
-      tx.onerror = function () { reject(tx.error || new Error('idb put failed')); };
-    });
-    db.close();
-  }
   async function idbGetAll() {
     var db = await idbOpen();
     var items = await new Promise(function (resolve, reject) {
@@ -358,6 +348,18 @@
       tx.objectStore(IDB_STORE).clear();
       tx.oncomplete = function () { resolve(); };
       tx.onerror = function () { reject(tx.error || new Error('idb clear failed')); };
+    });
+    db.close();
+  }
+  async function idbReplaceAll(items) {
+    var db = await idbOpen();
+    await new Promise(function (resolve, reject) {
+      var tx = db.transaction(IDB_STORE, 'readwrite');
+      var store = tx.objectStore(IDB_STORE);
+      store.clear();
+      for (var i = 0; i < items.length; i++) store.put(items[i]);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error || new Error('idb replace failed')); };
     });
     db.close();
   }
@@ -387,9 +389,10 @@
     var el = $('indexInfo');
     if (!el) return;
     var range = '';
-    if (state.indexMeta && state.indexMeta.fromPage) {
-      var shownTo = state.indexMeta.partial ? Math.max(state.indexMeta.fromPage, state.indexMeta.lastPage || 0) : state.indexMeta.toPage;
-      range = ' · 页 ' + state.indexMeta.fromPage + '-' + shownTo + (state.indexMeta.partial ? '（未完成）' : '');
+    var meta = state.indexBuildRange || state.indexMeta;
+    if (meta && meta.fromPage) {
+      var shownTo = meta.partial ? Math.max(meta.fromPage, meta.lastPage || 0) : meta.toPage;
+      range = ' · 页 ' + meta.fromPage + '-' + shownTo + (meta.partial ? '（未完成）' : '');
     }
     el.textContent = '本地索引：' + state.indexCount + ' 条' + range + (extra ? (' · ' + extra) : '');
   }
@@ -427,8 +430,9 @@
   async function buildLocalIndex() {
     if (state.indexBuildBusy) return;
     var fromPage = parseInt(($('indexFromPage') && $('indexFromPage').value) || '1', 10);
-    var toPage = parseInt(($('indexToPage') && $('indexToPage').value) || String(fromPage), 10);
-    if (!isFinite(fromPage) || !isFinite(toPage) || fromPage < 1 || toPage < fromPage) {
+    var toRaw = (($('indexToPage') && $('indexToPage').value) || '').trim();
+    var requestedTo = toRaw ? parseInt(toRaw, 10) : null;
+    if (!isFinite(fromPage) || fromPage < 1 || (requestedTo != null && (!isFinite(requestedTo) || requestedTo < fromPage))) {
       setMsg($('status'), '请输入有效的索引页数范围', 'err');
       return;
     }
@@ -446,77 +450,118 @@
       var first = await listIndexPage(fromPage, 50);
       if (!first || first.status !== 'success') throw new Error((first && first.message) || '列表读取失败');
       var firstData = first.data || {};
-      var totalPages = Number(firstData.total_pages != null ? firstData.total_pages : firstData.totalPages) || toPage;
+      var totalPages = Number(firstData.total_pages != null ? firstData.total_pages : firstData.totalPages) || fromPage;
       if (fromPage > totalPages) throw new Error('起始页超过总页数 ' + totalPages);
-      toPage = Math.min(toPage, totalPages);
+      var toPage = requestedTo == null ? totalPages : Math.min(requestedTo, totalPages);
       if ($('indexToPage')) $('indexToPage').value = String(toPage);
+      state.indexBuildRange = { fromPage: fromPage, toPage: toPage, partial: false };
 
-      await idbClear();
-      refreshIndexMap([]);
-      state.indexMeta = { fromPage: fromPage, toPage: toPage, lastPage: fromPage - 1, partial: true, updatedAt: Date.now() };
-      localStorage.setItem('fzsm_local_index_meta', JSON.stringify(state.indexMeta));
-      var failed = 0;
+      var oldRecords = await idbGetAll();
+      var oldById = Object.create(null);
+      for (var oi = 0; oi < oldRecords.length; oi++) oldById[String(oldRecords[oi].id)] = oldRecords[oi];
 
-      for (var page = fromPage; page <= toPage; page++) {
-        if (token !== state.indexBuildToken) throw new Error('INDEX_CANCELLED');
-        var response = page === fromPage ? first : await listIndexPage(page, 50);
+      var pageRows = [{ page: fromPage, response: first }];
+      var pageNums = [];
+      for (var p = fromPage + 1; p <= toPage; p++) pageNums.push(p);
+      var fetched = await mapPool(pageNums, INDEX_LIST_CONCURRENCY, async function (page) {
+        if (token !== state.indexBuildToken) return null;
+        var response = await listIndexPage(page, 50);
         if (!response || response.status !== 'success') throw new Error((response && response.message) || ('第 ' + page + ' 页读取失败'));
-        var data = response.data || {};
-        var roles = Array.isArray(data.items) ? data.items : [];
-        updateIndexInfo('处理第 ' + page + '/' + toPage + ' 页…');
-        var records = await mapPool(roles, FEAT_CONCURRENCY, async function (role) {
+        return { page: page, response: response };
+      }, function (done, total) {
+        updateIndexInfo('读取列表 ' + (done + 1) + '/' + (total + 1) + ' 页…');
+      });
+      if (token !== state.indexBuildToken) throw new Error('INDEX_CANCELLED');
+      for (var fi = 0; fi < fetched.length; fi++) {
+        if (!fetched[fi]) throw new Error('部分列表页读取失败');
+        pageRows.push(fetched[fi]);
+      }
+      pageRows.sort(function (a, b) { return a.page - b.page; });
+
+      var targets = [];
+      var seen = Object.create(null);
+      for (var pr = 0; pr < pageRows.length; pr++) {
+        var roles = (pageRows[pr].response.data && pageRows[pr].response.data.items) || [];
+        for (var rr = 0; rr < roles.length; rr++) {
+          var item = sanitizeRole(roles[rr]);
+          if (!item || item.id == null || !item.image || seen[String(item.id)]) continue;
+          seen[String(item.id)] = 1;
+          targets.push({ item: item, page: pageRows[pr].page, old: oldById[String(item.id)] || null });
+        }
+      }
+
+      var finalRecords = [];
+      var needFeatures = [];
+      for (var ti = 0; ti < targets.length; ti++) {
+        var target = targets[ti];
+        var old = target.old;
+        if (old && old.image === target.item.image && old.ahash && old.dhash && old.luma) {
+          finalRecords.push({
+            id: target.item.id,
+            name: target.item.name,
+            image: target.item.image,
+            ahash: old.ahash,
+            dhash: old.dhash,
+            luma: old.luma,
+            colors: old.colors || [],
+            views: target.item.views || 0,
+            likes: target.item.likes || 0,
+            page: target.page,
+            updatedAt: old.updatedAt || Date.now(),
+          });
+        } else {
+          needFeatures.push(target);
+        }
+      }
+
+      var failed = 0;
+      var generated = await mapPool(needFeatures, FEAT_CONCURRENCY, async function (target) {
           if (token !== state.indexBuildToken) return null;
-          var item = sanitizeRole(role);
-          if (!item || !item.image) return null;
           try {
-            var feat = await featuresFromSrc(item.image, false);
+            var feat = await featuresFromSrc(target.item.image, false);
             if (token !== state.indexBuildToken) return null;
             return {
-              id: item.id,
-              name: item.name,
-              image: item.image,
+              id: target.item.id,
+              name: target.item.name,
+              image: target.item.image,
               ahash: feat.ahash,
               dhash: feat.dhash,
               luma: feat.luma,
               colors: colorsToArr(feat.colors),
-              views: item.views || 0,
-              likes: item.likes || 0,
-              page: page,
+              views: target.item.views || 0,
+              likes: target.item.likes || 0,
+              page: target.page,
               updatedAt: Date.now(),
             };
           } catch (e) {
             failed++;
-            return null;
+            return target.old || null;
           }
+        }, function (done, total) {
+          updateIndexInfo('提取新特征 ' + done + '/' + total + '…');
         });
-        records = records.filter(Boolean);
-        await idbPutMany(records);
-        for (var i = 0; i < records.length; i++) {
-          var indexed = itemFromIndexRec(records[i]);
-          if (indexed) state.indexMap[String(indexed.id)] = indexed;
-        }
-        state.indexCount = Object.keys(state.indexMap).length;
-        state.indexMeta.lastPage = page;
-        state.indexMeta.updatedAt = Date.now();
-        localStorage.setItem('fzsm_local_index_meta', JSON.stringify(state.indexMeta));
-        updateIndexInfo('第 ' + page + '/' + toPage + ' 页 · 失败 ' + failed);
-        await new Promise(function (resolve) { setTimeout(resolve, 0); });
-      }
+      if (token !== state.indexBuildToken) throw new Error('INDEX_CANCELLED');
+      for (var gi = 0; gi < generated.length; gi++) if (generated[gi]) finalRecords.push(generated[gi]);
+
+      await idbReplaceAll(finalRecords);
+      refreshIndexMap(finalRecords);
 
       state.indexMeta = { fromPage: fromPage, toPage: toPage, lastPage: toPage, partial: false, updatedAt: Date.now() };
       localStorage.setItem('fzsm_local_index_meta', JSON.stringify(state.indexMeta));
-      updateIndexInfo('创建完成' + (failed ? (' · 失败 ' + failed) : ''));
-      setMsg($('status'), '本地索引创建完成：' + state.indexCount + ' 条', 'ok');
+      var reused = finalRecords.length - generated.filter(Boolean).length;
+      updateIndexInfo('完成 · 复用 ' + reused + ' · 新处理 ' + needFeatures.length + (failed ? (' · 失败 ' + failed) : ''));
+      setMsg($('status'), '本地索引更新完成：' + state.indexCount + ' 条', 'ok');
     } catch (e) {
       if (String(e && e.message) === 'INDEX_CANCELLED') {
         updateIndexInfo('已取消');
-        setMsg($('status'), '已取消创建索引，当前保留 ' + state.indexCount + ' 条', 'ok');
+        setMsg($('status'), '已取消，原本地索引保持不变', 'ok');
       } else {
         updateIndexInfo('创建失败');
         setMsg($('status'), '创建索引失败：' + (e.message || e), 'err');
       }
     } finally {
       state.indexBuildBusy = false;
+      state.indexBuildRange = null;
       if (buildBtn) buildBtn.disabled = false;
       if (cancelBtn) cancelBtn.classList.add('hidden');
     }
